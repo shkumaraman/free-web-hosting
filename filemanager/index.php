@@ -448,9 +448,9 @@ input,textarea{font-family:inherit}
 .toast.success .toast-fill{background:var(--green)}
 .toast.error .toast-fill{background:var(--red);width:100%}
 #upload-modal .modal{width:480px}
-#upload-drop{border:2px dashed var(--border2);border-radius:var(--radius2);padding:30px;text-align:center;color:var(--text2);cursor:pointer;transition:var(--trans)}
+#upload-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed var(--border2);border-radius:var(--radius2);padding:30px;text-align:center;color:var(--text2);cursor:pointer;transition:var(--trans)}
 #upload-drop:hover,#upload-drop.drag{border-color:var(--acc);background:var(--acc-glow);color:var(--acc)}
-#upload-drop i{font-size:40px;display:block;margin-bottom:10px}
+#upload-drop i{font-size:40px;margin-bottom:10px}
 #upload-drop p{font-size:13px}
 #upload-list{margin-top:12px;display:flex;flex-direction:column;gap:6px;max-height:180px;overflow-y:auto}
 .upload-item{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px}
