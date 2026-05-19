@@ -6,13 +6,14 @@
 <img src="https://img.shields.io/badge/Alpine-Linux-0D597F?style=for-the-badge&logo=alpine-linux&logoColor=white" />
 <img src="https://img.shields.io/badge/Hugging%20Face-Spaces-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" />
 <img src="https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white" />
+<img src="https://img.shields.io/badge/Web%20Terminal-Integrated-4d4d4d?style=for-the-badge&logo=gnu-bash&logoColor=white" />
 <img src="https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge" />
 
 # 🐘 PHP Web Server — Alpine LAMP Stack
 
 ### ⚡ Lightweight · 🔒 Secure · 🚀 Production-Ready
 
-> A complete PHP development environment packed into a **single Docker container** — Apache, PHP 8+, MariaDB, phpMyAdmin, File Manager & Web Terminal.  
+> A complete PHP development environment packed into a **single Docker container** — Apache, PHP 8+, MariaDB, phpMyAdmin, and a File Manager with an integrated Web Terminal.  
 > Deploy on **Hugging Face Spaces** for free, or on any **VPS / local machine**.
 
 </div>
@@ -45,7 +46,7 @@
 | 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
 | 📁 **File Manager** | [TinyFileManager](https://github.com/prasathmani/tinyfilemanager) at `/files` |
-| 💻 **Web Terminal** | Custom browser-based shell at `/terminal` — no SSH needed |
+| 💻 **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount **required** — database is stored here |
 | 🔒 **Non-root** | Runs as user `1000` for improved security |
@@ -64,7 +65,7 @@ Alpine Linux (latest)
 ├── MariaDB            → Database server
 ├── phpMyAdmin         → Database UI at /sql
 ├── TinyFileManager    → File manager at /files
-├── Web Terminal       → Custom shell UI at /terminal
+├── Web Terminal       → Integrated into File Manager at /files
 ├── Composer           → PHP dependency manager
 ├── Git, Nano, Wget, Zip, Unzip, ImageMagick
 ```
@@ -175,7 +176,6 @@ On Hugging Face, environment variables are configured in **Space Settings** — 
 | `MYSQL_DATABASE` | `admin` | Database name |
 | `SQL_PATH` | `sql` | URL path for phpMyAdmin — e.g. `mysecretdb` opens at `/mysecretdb` |
 | `FILES_PATH` | `files` | URL path for File Manager |
-| `TERMINAL_PATH` | `terminal` | URL path for Web Terminal |
 
 ### Step 4 — Mount Persistent Storage 🚨
 
@@ -269,7 +269,6 @@ http://YOUR_VPS_IP:7860/   → Remote VPS
 | 🏠 **Website** | `/` | — |
 | 🗄️ **Database UI** | `/sql` | `SQL_PATH` |
 | 📁 **File Manager** | `/files` | `FILES_PATH` |
-| 💻 **Web Terminal** | `/terminal` | `TERMINAL_PATH` |
 
 > **Web root directory:** `/var/www/localhost/htdocs`
 
@@ -427,7 +426,9 @@ Password : admin@123
 
 ## 💻 Web Terminal
 
-A custom PHP-powered browser shell is available at `/terminal` — no SSH required.
+A PHP-powered browser shell is integrated directly into the File Manager — no SSH required. 
+
+To access it, open the **File Manager** (`/files`) and click the **Terminal** button in the top navigation bar.
 
 ### 📊 System Monitoring
 
@@ -638,7 +639,6 @@ Your custom domain now proxies all traffic to your Hugging Face Space.
 https://yourdomain.com/        → Your website
 https://yourdomain.com/sql     → phpMyAdmin
 https://yourdomain.com/files   → File Manager
-https://yourdomain.com/terminal → Web Terminal
 ```
 
 The original `*.hf.space` URL still works too — the Worker doesn't disable it, it just adds your custom domain on top.
