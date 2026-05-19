@@ -45,8 +45,8 @@
 | 🐘 **PHP 8+** | With OPcache pre-enabled — runs 2x–3x faster out of the box |
 | 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
-| 📁 **File Manager** | [TinyFileManager](https://github.com/prasathmani/tinyfilemanager) at `/files` |
-| 💻 **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
+| 📁 **File Manager** | File Manager Pro at `/files` |
+| � **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount **required** — database is stored here |
 | 🔒 **Non-root** | Runs as user `1000` for improved security |
@@ -64,7 +64,7 @@ Alpine Linux (latest)
 ├── PHP 8.4
 ├── MariaDB            → Database server
 ├── phpMyAdmin         → Database UI at /sql
-├── TinyFileManager    → File manager at /files
+├── File Manager       → Custom File Manager Pro at /files
 ├── Web Terminal       → Integrated into File Manager at /files
 ├── Composer           → PHP dependency manager
 ├── Git, Nano, Wget, Zip, Unzip, ImageMagick
@@ -392,39 +392,12 @@ $debug = $_ENV['APP_DEBUG'];
 
 ## 📁 File Manager
 
-This setup uses [TinyFileManager](https://github.com/prasathmani/tinyfilemanager) — accessible at `/files`.
+This setup uses a **File Manager Pro** — accessible at `/files`.
 
-By default, authentication is **disabled** for easy development.
+> 🔒 **Security Tip:** To keep your files secure, **change the default URL** by setting the `FILES_PATH` environment variable in your Space Settings to something secret (e.g., `FILES_PATH=my-secret-files`).
 
-### 🔐 Enable Login (Required for Public Servers!)
 
-1. Open **Web Terminal** (`/terminal`) or **File Manager** (`/files`)
-2. Navigate to:
-   ```
-   /usr/share/webapps/filemanager/
-   ```
-3. Open `index.php` and find:
-   ```php
-   $use_auth = false;
-   ```
-4. Change it to:
-   ```php
-   $use_auth = true;
-   ```
-5. Save — the login screen is now active! ✅
-
-### Default File Manager Credentials
-
-```
-Username : admin
-Password : admin@123
-```
-
-> 💡 Change the password via the **Settings ⚙️** icon inside TinyFileManager.
-
----
-
-## 💻 Web Terminal
+##  Web Terminal
 
 A PHP-powered browser shell is integrated directly into the File Manager — no SSH required. 
 
@@ -683,7 +656,7 @@ The original `*.hf.space` URL still works too — the Worker doesn't disable it,
 - 💾 **Persistent Storage Required:** Mount `/data` in Space Settings — without it, database resets on every restart
 - 🗜️ **Fast Deploys:** Upload a `.zip` via File Manager and extract it directly on the server
 - ⚡ **OPcache:** Already enabled — PHP apps run 2x–3x faster with zero extra config
-- 🔒 **Going Public?** Enable File Manager login and set a strong `MYSQL_PASSWORD`
+- 🔒 **Going Public?** Change `FILES_PATH` and `SQL_PATH` to secret URLs and set a strong `MYSQL_PASSWORD`
 - 🛠️ **Composer & Git** are pre-installed — install PHP packages directly from the terminal
 - 🖥️ **No SSH Needed:** The Web Terminal handles all server management from your browser
 - 🔄 **mod_rewrite:** Enabled by default — Laravel, WordPress, and other frameworks work out of the box
