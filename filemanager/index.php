@@ -311,7 +311,7 @@ if (isset($_GET['api'])) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>File Manager Pro</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@latest/css/all.min.css">
 <style>
 :root {
   --bg: #ffffff; --surface: #f5f6f8; --surface2: #e6e9ef;
@@ -735,6 +735,7 @@ function render(items) {
   });
 
   if (!sorted.length) {
+    list.className = '';
     list.innerHTML = `<div class="empty-state"><i class="fa-solid fa-folder-open"></i><p>Empty folder</p></div>`;
     return;
   }
@@ -905,7 +906,7 @@ function promptAction(action) {
   document.getElementById('prompt-input').value = '';
   if (action === 'mkdir') {
     document.getElementById('prompt-title').innerHTML = '<i class="fa-solid fa-folder-plus"></i> New Folder';
-    document.getElementById('prompt-label').textContent = 'Folder Name';
+    document.getElementById('prompt-input').placeholder = 'Folder Name';
     window._promptAction = async () => {
       const name = document.getElementById('prompt-input').value.trim();
       if (!name) return;
@@ -914,7 +915,7 @@ function promptAction(action) {
     };
   } else {
     document.getElementById('prompt-title').innerHTML = '<i class="fa-solid fa-file-plus"></i> New File';
-    document.getElementById('prompt-label').textContent = 'File Name';
+    document.getElementById('prompt-input').placeholder = 'File Name';
     window._promptAction = async () => {
       const name = document.getElementById('prompt-input').value.trim();
       if (!name) return;
