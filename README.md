@@ -45,7 +45,7 @@
 | 🐘 **PHP 8+** | With OPcache pre-enabled — runs 2x–3x faster out of the box |
 | 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
-| 📁 **File Manager** | File Manager Pro at `/files` |
+| 📁 **File Manager Pro** | File Manager Pro at `/files` |
 | � **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount **required** — database is stored here |
