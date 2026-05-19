@@ -484,6 +484,12 @@ input,textarea{font-family:inherit}
 .empty-state p{font-size:14px}
 .sort-asc::after{content:' ↑'}
 .sort-desc::after{content:' ↓'}
+.sidebar-close{display:none;position:absolute;top:10px;right:14px;background:transparent;border:none;color:var(--text2);font-size:24px;cursor:pointer;z-index:200;padding:4px}
+@media(max-width:768px){
+  .sidebar-close{display:block}
+  #sidebar{padding-top:45px}
+}
+.nav-item:active{transform:scale(0.98)}
 </style>
 </head>
 <body>
@@ -511,10 +517,10 @@ input,textarea{font-family:inherit}
 
 <div id="main">
   <div id="sidebar">
+    <button class="sidebar-close" onclick="toggleSidebar()"><i class="fa-solid fa-xmark"></i></button>
     <div class="sidebar-section">Navigation</div>
     <div class="nav-item active" id="nav-local" onclick="loadLocalRoot()"><i class="fa-solid fa-house"></i> Root (htdocs)</div>
     <div class="nav-item" id="nav-remote" onclick="remoteMode ? loadRemote() : promptSFTP()"><i class="fa-solid fa-network-wired"></i> <span id="sftp-label">Connect SFTP</span></div>
-    <div class="nav-item" onclick="openTerminal()"><i class="fa-solid fa-terminal"></i> Terminal</div>
     <div class="sidebar-section">Quick Actions</div>
     <div class="nav-item" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> New Folder</div>
     <div class="nav-item" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-circle-plus"></i> New File</div>
@@ -543,7 +549,6 @@ input,textarea{font-family:inherit}
       <button class="btn btn-ghost btn-sm" id="zip-sel-btn" onclick="zipSelected()" style="display:none"><i class="fa-solid fa-file-zipper"></i></button>
       <button class="btn btn-ghost btn-sm" id="clear-sel-btn" onclick="clearSelection()" style="display:none"><i class="fa-solid fa-xmark"></i></button>
       <div style="flex:1"></div>
-      <button class="btn btn-ghost btn-sm" onclick="openTerminal()"><i class="fa-solid fa-terminal"></i></button>
       <button class="view-btn active" id="vbtn-grid" onclick="setView('grid')"><i class="fa-solid fa-grip"></i></button>
       <button class="view-btn" id="vbtn-list" onclick="setView('list')"><i class="fa-solid fa-list"></i></button>
     </div>
@@ -1112,6 +1117,8 @@ function setView(v) {
   currentView = v;
   document.getElementById('vbtn-grid').classList.toggle('active', v==='grid');
   document.getElementById('vbtn-list').classList.toggle('active', v==='list');
+  document.getElementById('nav-grid').classList.toggle('active', v==='grid');
+  document.getElementById('nav-list').classList.toggle('active', v==='list');
   render();
 }
 function openModal(id) { document.getElementById(id).classList.add('open'); }
@@ -1203,6 +1210,15 @@ function loadLocalRoot() {
   } else load('');
 }
 function loadRemote() { load(remoteCwd); }
+
+// Auto-close sidebar on mobile when a nav item is clicked
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    if (window.innerWidth <= 768) {
+      document.getElementById('sidebar').classList.remove('open');
+    }
+  });
+});
 
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escJs(s) { return String(s).replace(/'/g,"\\'").replace(/\\/g,'\\\\'); }
