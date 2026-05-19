@@ -2,6 +2,7 @@
 session_start();
 $base_dir = realpath('/var/www/localhost/htdocs');
 require_once __DIR__ . '/vendor/autoload.php';
+
 function get_absolute_path($path) {
     global $base_dir;
     $path = str_replace(['../', '..\\'], '', $path);
@@ -12,16 +13,19 @@ function get_absolute_path($path) {
     if ($real !== false && strpos($real, $base_dir) !== 0) return $base_dir;
     return $real !== false ? $real : $base_dir . '/' . ltrim($path, '/');
 }
+
 function get_relative_path($path) {
     global $base_dir;
     return ltrim(substr($path, strlen($base_dir)), '/');
 }
+
 function format_size($bytes) {
     if ($bytes >= 1073741824) return number_format($bytes / 1073741824, 2) . ' GB';
     if ($bytes >= 1048576) return number_format($bytes / 1048576, 2) . ' MB';
     if ($bytes >= 1024) return number_format($bytes / 1024, 2) . ' KB';
     return $bytes . ' B';
 }
+
 function get_mime($file) {
     $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
     $map = [
@@ -35,6 +39,7 @@ function get_mime($file) {
     ];
     return $map[$ext] ?? 'application/octet-stream';
 }
+
 function sftp_connect() {
     if (!class_exists('phpseclib3\Net\SFTP')) return false;
     if (empty($_SESSION['sftp'])) return false;
@@ -47,11 +52,36 @@ function sftp_connect() {
         return false;
     }
 }
+
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
     $action = $_GET['api'];
     $dir = isset($_GET['dir']) ? $_GET['dir'] : '';
     $is_sftp = !empty($_SESSION['sftp_active']);
+    
+    // --- TERMINAL LOGIC START ---
+    if ($action === 'terminal') {
+        $req = json_decode(file_get_contents('php://input'), true) ?: [];
+        $cwd = $_SESSION['term_cwd'] ?? $base_dir;
+        $cmd = trim($req['cmd'] ?? '');
+        if (!$cmd) { echo json_encode(['out' => '', 'cwd' => $cwd]); exit; }
+        
+        $escaped_cwd = escapeshellarg($cwd);
+        $full = "cd {$escaped_cwd} 2>/dev/null; {$cmd}; printf '__PWD__%s' \"\$(pwd)\"";
+        $raw = shell_exec($full . ' 2>&1') ?? '';
+        $pos = strrpos($raw, '__PWD__');
+        
+        if ($pos !== false) {
+            $out = substr($raw, 0, $pos);
+            $_SESSION['term_cwd'] = trim(substr($raw, $pos + 7));
+        } else {
+            $out = $raw;
+        }
+        echo json_encode(['out' => htmlspecialchars($out), 'cwd' => $_SESSION['term_cwd']]);
+        exit;
+    }
+    // --- TERMINAL LOGIC END ---
+
     if ($action === 'sftp_connect') {
         $req = json_decode(file_get_contents('php://input'), true) ?: [];
         $_SESSION['sftp'] = [
@@ -336,7 +366,6 @@ if (isset($_GET['api'])) {
   @media (max-width: 991.98px) { .sidebar { display: none; } }
   .toast-container { position: fixed; bottom: 1rem; right: 1rem; z-index: 1060; }
   .breadcrumb-item + .breadcrumb-item::before { content: "›"; }
-  #terminal-iframe { width: 100%; height: 70vh; border: none; }
   #drop-overlay { display: none; position: absolute; inset: 0; background: rgba(13,110,253,0.05); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(2px); }
   .modal-xl-custom { max-width: 90vw; }
 </style>
@@ -358,7 +387,7 @@ if (isset($_GET['api'])) {
       <span class="navbar-brand mb-0 h1 me-auto d-none d-sm-inline">File Manager Pro</span>
       <form class="d-flex me-2 flex-grow-1" onsubmit="event.preventDefault(); searchFiles(this.search.value)"><input class="form-control me-2" type="search" name="search" placeholder="Search files..."></form>
       <button class="btn btn-primary me-1" onclick="openUpload()"><i class="fa-solid fa-cloud-arrow-up"></i> <span class="d-none d-md-inline">Upload</span></button>
-      <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#terminalModal"><i class="fa-solid fa-terminal"></i> <span class="d-none d-md-inline">Terminal</span></button>
+      <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#terminalModal" id="btn-terminal-open"><i class="fa-solid fa-terminal"></i> <span class="d-none d-md-inline">Terminal</span></button>
     </div>
   </nav>
   <div class="bg-light border-bottom px-3 py-1 d-flex align-items-center flex-wrap">
@@ -390,14 +419,26 @@ if (isset($_GET['api'])) {
   </div>
   <div class="bg-light border-top px-3 py-1 small d-flex justify-content-between" id="statusbar"><span id="sb-items">–</span><span id="sb-path" class="font-monospace text-muted">/</span></div>
 </div>
+
+<!-- NATIVE TERMINAL MODAL -->
 <div class="modal fade" id="terminalModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-xl modal-dialog-centered">
-    <div class="modal-content">
-      <div class="modal-header"><h5 class="modal-title"><i class="fa-solid fa-terminal"></i> Web Terminal</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-      <div class="modal-body p-0"><iframe id="terminal-iframe" src="/terminal"></iframe></div>
+    <div class="modal-content" style="background-color: #1e1e1e; border: 1px solid #333;">
+      <div class="modal-header border-bottom-0">
+        <h5 class="modal-title text-light"><i class="fa-solid fa-terminal"></i> Web Terminal</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-3 font-monospace" style="height: 60vh; overflow-y: auto; color: #00ff00;" id="term-body" onclick="document.getElementById('term-input').focus()">
+         <div id="term-output" style="white-space: pre-wrap; word-wrap: break-word;">Alpine Server Terminal - Ready.<br></div>
+         <div class="d-flex mt-2">
+            <span id="term-prompt" class="me-2 text-info">$ /var/www/localhost/htdocs</span>
+            <input type="text" id="term-input" style="flex: 1; background: transparent; color: #00ff00; border: none; outline: none; box-shadow: none; font-family: monospace;" autocomplete="off">
+         </div>
+      </div>
     </div>
   </div>
 </div>
+
 <div class="modal fade" id="sftpModal" tabindex="-1">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -428,6 +469,7 @@ if (isset($_GET['api'])) {
   <div class="modal-dialog modal-xl-custom"><div class="modal-content"><div class="modal-header"><h5 class="modal-title" id="preview-title"></h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body" id="preview-content" style="min-height: 60vh;"></div></div></div>
 </div>
 <div class="toast-container" id="toast-container"></div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 let currentPath = '', currentItems = [], currentView = 'grid', multiSelect = false, selected = new Set(), sortField = 'name', sortAsc = true, remoteMode = false, remoteCwd = '/', editingPath = '', pendingFiles = [], renameTarget = '', currentPreviewPath = '';
@@ -787,7 +829,7 @@ function renderSidebar(containerId) {
     <div class="nav flex-column px-2 py-2">
       <a class="nav-link ${!remoteMode?'active':''}" onclick="loadLocalRoot()"><i class="fa-solid fa-house me-2"></i> Local (htdocs)</a>
       <a class="nav-link ${remoteMode?'active':''}" onclick="remoteMode ? loadRemote() : promptSFTP()"><i class="fa-solid fa-network-wired me-2"></i> ${remoteMode ? 'Remote SFTP' : 'Connect SFTP'}</a>
-      <a class="nav-link" data-bs-toggle="modal" data-bs-target="#terminalModal"><i class="fa-solid fa-terminal me-2"></i> Terminal</a>
+      <a class="nav-link" data-bs-toggle="modal" data-bs-target="#terminalModal" onclick="setTimeout(()=>document.getElementById('term-input').focus(),500)"><i class="fa-solid fa-terminal me-2"></i> Terminal</a>
       <hr>
       <a class="nav-link" onclick="load()"><i class="fa-solid fa-rotate-left me-2"></i> Refresh</a>
       <a class="nav-link" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus me-2"></i> New Folder</a>
@@ -825,6 +867,39 @@ function loadLocalRoot() {
     });
   } else load('');
 }
+
+// --- TERMINAL JAVASCRIPT LOGIC ---
+document.getElementById('btn-terminal-open').addEventListener('click', function() {
+    setTimeout(() => document.getElementById('term-input').focus(), 500);
+});
+
+document.getElementById('term-input').addEventListener('keypress', function(e) {
+  if (e.key === 'Enter') {
+    const cmd = this.value.trim();
+    if (!cmd) return;
+    this.value = '';
+    
+    const outDiv = document.getElementById('term-output');
+    const promptTxt = document.getElementById('term-prompt').textContent;
+    outDiv.innerHTML += `\n<span class="text-info">${promptTxt}</span> ${escHtml(cmd)}\n`;
+    
+    fetch('?api=terminal', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cmd: cmd})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.out) outDiv.innerHTML += data.out;
+        document.getElementById('term-prompt').textContent = '$ ' + data.cwd;
+        const body = document.getElementById('term-body');
+        body.scrollTop = body.scrollHeight; 
+    })
+    .catch(err => outDiv.innerHTML += '\n<span class="text-danger">Error executing command.</span>\n');
+  }
+});
+// --------------------------------
+
 renderSidebar('sidebar-content-desktop');
 renderSidebar('sidebar-content-mobile');
 load('');
