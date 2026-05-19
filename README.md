@@ -545,6 +545,7 @@ export default {
       headers.delete("x-powered-by");
       headers.delete("server");
       headers.delete("cf-cache-status");
+      headers.delete("content-security-policy");
       headers.set("X-Frame-Options", "SAMEORIGIN");
       headers.set("X-Content-Type-Options", "nosniff");
       headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
