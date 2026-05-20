@@ -1,5 +1,7 @@
 <div align="center">
-
+<p align="center">
+  <img src="3a87c554-19da-4aba-bb2e-33a950476d90.png" alt="Banner">
+</p>
 <img src="https://img.shields.io/badge/PHP-8%2B-777BB4?style=for-the-badge&logo=php&logoColor=white" />
 <img src="https://img.shields.io/badge/Apache-Web%20Server-D22128?style=for-the-badge&logo=apache&logoColor=white" />
 <img src="https://img.shields.io/badge/MariaDB-Database-003545?style=for-the-badge&logo=mariadb&logoColor=white" />
