@@ -1,7 +1,9 @@
-<div align="center">
 <p align="center">
   <img src="/3a87c554-19da-4aba-bb2e-33a950476d90.png" alt="Banner">
 </p>
+
+<div align="center">
+
 <img src="https://img.shields.io/badge/PHP-8%2B-777BB4?style=for-the-badge&logo=php&logoColor=white" />
 <img src="https://img.shields.io/badge/Apache-Web%20Server-D22128?style=for-the-badge&logo=apache&logoColor=white" />
 <img src="https://img.shields.io/badge/MariaDB-Database-003545?style=for-the-badge&logo=mariadb&logoColor=white" />
@@ -47,7 +49,7 @@
 | 🐘 **PHP 8+** | With OPcache pre-enabled — runs 2x–3x faster out of the box |
 | 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
-| 📁 **File Manager Pro** | File Manager Pro at `/files` |
+| 📁 **File Manager** | File Manager Pro at `/files` |
 | � **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount **required** — database is stored here |
@@ -506,21 +508,25 @@ export default {
         } catch {}
       }
 
-      const body = request.method === "GET" || request.method === "HEAD"
-        ? undefined
-        : await request.arrayBuffer();
+          const body =
+            request.method === "GET" || request.method === "HEAD"
+              ? undefined
+              : await request.arrayBuffer();
 
-      const response = await fetch(new Request(backendUrl.toString(), {
-        method: request.method,
-        headers: newHeaders,
-        body: body,
-        redirect: "manual",
-      }));
+          const response = await fetch(
+            new Request(backendUrl.toString(), {
+              method: request.method,
+              headers: newHeaders,
+              body,
+              redirect: "manual",
+            })
+          );
 
       const headers = new Headers();
 
       for (const [key, value] of response.headers.entries()) {
         if (key.toLowerCase() === "set-cookie") continue;
+
         if (key.toLowerCase() === "location") {
           try {
             const loc = new URL(value);
@@ -532,14 +538,19 @@ export default {
           }
           continue;
         }
+
         headers.set(key, value);
       }
 
-      for (const cookie of response.headers.getAll("set-cookie")) {
-        headers.append("set-cookie", cookie
-          .replace(/;\s*Domain=[^;]*/gi, "")
-          .replace(/;\s*SameSite=[^;]*/gi, "")
-          .concat("; SameSite=Lax")
+          const setCookies = response.headers.getSetCookie?.() || [];
+
+          for (const cookie of setCookies) {
+            headers.append(
+              "set-cookie",
+              cookie
+                .replace(/;\s*Domain=[^;]*/gi, "")
+                .replace(/;\s*SameSite=[^;]*/gi, "")
+                .concat("; SameSite=Lax")
         );
       }
 
@@ -547,11 +558,15 @@ export default {
       headers.delete("x-powered-by");
       headers.delete("server");
       headers.delete("cf-cache-status");
-      headers.delete("content-security-policy");
+          headers.delete("content-security-policy");
+
       headers.set("X-Frame-Options", "SAMEORIGIN");
       headers.set("X-Content-Type-Options", "nosniff");
       headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
-      headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+          headers.set(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains"
+          );
       headers.set("X-XSS-Protection", "1; mode=block");
 
       return new Response(response.body, {
@@ -559,9 +574,10 @@ export default {
         statusText: response.statusText,
         headers,
       });
-
     } catch (err) {
-      return new Response(`Worker Error: ${err.message}`, { status: 500 });
+          return new Response(`Worker Error: ${err.message}`, {
+            status: 500,
+          });
     }
   },
 };
