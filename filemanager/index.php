@@ -457,6 +457,9 @@ input,textarea{font-family:inherit}
 .upload-item i{color:var(--text2)}
 .upload-item .ui-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .upload-item .ui-size{color:var(--text2);white-space:nowrap}
+.upload-item.done{border-color:rgba(0,138,32,.35);background:rgba(0,138,32,.05)}
+.upload-item.failed{border-color:rgba(192,43,10,.35);background:rgba(192,43,10,.05)}
+.upload-item .ui-status{font-size:11px;color:var(--text2);white-space:nowrap}
 #preview-modal .modal{width:85vw;max-width:1000px;height:85vh}
 #preview-content{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;background:#fafbfc}
 #preview-content img,#preview-content video,#preview-content audio{max-width:100%;max-height:100%;border-radius:4px}
@@ -648,7 +651,7 @@ input,textarea{font-family:inherit}
       <input type="file" id="file-input" multiple style="display:none" onchange="fileInputChanged(this.files)">
       <div id="upload-list"></div>
     </div>
-    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal('upload-modal')">Cancel</button><button class="btn btn-primary" id="upload-btn" onclick="doUpload()" disabled>Upload</button></div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="clearUploadQueue()">Clear</button><button class="btn btn-ghost" onclick="closeModal('upload-modal')">Close</button><button class="btn btn-primary" id="upload-btn" onclick="doUpload()" disabled>Upload</button></div>
   </div>
 </div>
 
@@ -956,7 +959,6 @@ function selectAll() {
   const headerCb = document.getElementById('header-select-all');
   if (headerCb) headerCb.checked = true;
   updateSelectionUI();
-  showToast('All items selected', 'success');
 }
 function toggleMultiSelect() {
   multiSelect = !multiSelect;
@@ -1225,21 +1227,69 @@ function downloadFile(path) {
     .then(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = path.split('/').pop(); a.click(); });
 }
 function openUpload() { pendingFiles = []; renderUploadList(); openModal('upload-modal'); }
-function fileInputChanged(files) { pendingFiles = [...pendingFiles, ...files]; renderUploadList(); }
+function fileInputChanged(files) {
+  pendingFiles = [...pendingFiles, ...files];
+  renderUploadList();
+  document.getElementById('file-input').value = '';
+}
 function renderUploadList() {
   const ul = document.getElementById('upload-list');
   const btn = document.getElementById('upload-btn');
-  ul.innerHTML = pendingFiles.map(f => `<div class="upload-item"><i class="fa-solid fa-file"></i><span class="ui-name">${escHtml(f.name)}</span><span class="ui-size">${fmtSize(f.size)}</span></div>`).join('');
-  btn.disabled = pendingFiles.length === 0;
+  ul.innerHTML = pendingFiles.map(f => `<div class="upload-item"><i class="fa-solid fa-file"></i><span class="ui-name">${escHtml(f.name)}</span><span class="ui-size">${fmtSize(f.size)}</span><span class="ui-status">Ready</span></div>`).join('');
+  btn.disabled = pendingFiles.length === 0 || btn.dataset.busy === '1';
+}
+function clearUploadQueue() {
+  if (document.getElementById('upload-btn').dataset.busy === '1') return;
+  pendingFiles = [];
+  document.getElementById('file-input').value = '';
+  renderUploadList();
 }
 async function doUpload() {
   if (!pendingFiles.length) return;
-  closeModal('upload-modal');
-  const res = await api('upload', pendingFiles, true);
-  if (res.status === 'success') showToast('Uploaded','success');
-  else showToast('Upload failed','error');
-  pendingFiles = [];
-  load();
+  const btn = document.getElementById('upload-btn');
+  const list = document.getElementById('upload-list');
+  btn.dataset.busy = '1';
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading';
+  list.querySelectorAll('.ui-status').forEach(el => el.textContent = 'Uploading');
+
+  try {
+    const uploadedPath = remoteMode ? remoteCwd : currentPath;
+    const res = await api('upload', pendingFiles, true);
+    if (res.status === 'success') {
+      const uploaded = new Set(res.uploaded || pendingFiles.map(f => f.name));
+      list.querySelectorAll('.upload-item').forEach((row, index) => {
+        const file = pendingFiles[index];
+        const ok = file && uploaded.has(file.name);
+        row.classList.toggle('done', ok);
+        row.classList.toggle('failed', !ok);
+        const status = row.querySelector('.ui-status');
+        if (status) status.textContent = ok ? 'Uploaded' : 'Skipped';
+      });
+      pendingFiles = [];
+      document.getElementById('file-input').value = '';
+      await load(uploadedPath);
+      openModal('upload-modal');
+    } else {
+      list.querySelectorAll('.upload-item').forEach(row => {
+        row.classList.add('failed');
+        const status = row.querySelector('.ui-status');
+        if (status) status.textContent = 'Failed';
+      });
+      showToast(res.message || 'Upload failed','error');
+    }
+  } catch (err) {
+    list.querySelectorAll('.upload-item').forEach(row => {
+      row.classList.add('failed');
+      const status = row.querySelector('.ui-status');
+      if (status) status.textContent = 'Failed';
+    });
+    showToast('Upload failed','error');
+  } finally {
+    btn.dataset.busy = '0';
+    btn.innerHTML = 'Upload';
+    btn.disabled = pendingFiles.length === 0;
+  }
 }
 function uploadDragOver(e) { e.preventDefault(); document.getElementById('upload-drop').classList.add('drag'); }
 function uploadDragLeave(e) { document.getElementById('upload-drop').classList.remove('drag'); }
