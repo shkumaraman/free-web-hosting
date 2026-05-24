@@ -490,6 +490,14 @@ input,textarea{font-family:inherit}
   #sidebar{padding-top:45px}
 }
 .nav-item:active{transform:scale(0.98)}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.spin-animation {
+  animation: spin 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  display: inline-block;
+}
 </style>
 </head>
 <body>
@@ -544,7 +552,8 @@ input,textarea{font-family:inherit}
       <button class="btn btn-ghost btn-sm" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> Folder</button>
       <button class="btn btn-ghost btn-sm" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-plus"></i> File</button>
       <div class="tool-sep"></div>
-      <button class="btn btn-ghost btn-sm" id="sel-btn" onclick="toggleMultiSelect()"><i class="fa-solid fa-check-double"></i> Select</button>
+      <button class="btn btn-ghost btn-sm" id="sel-btn" onclick="toggleMultiSelect()"><i class="fa-solid fa-check-double"></i> Multi-Select</button>
+      <button class="btn btn-ghost btn-sm" id="sel-all-btn" onclick="selectAll()"><i class="fa-solid fa-square-check"></i> Select All</button>
       <button class="btn btn-danger btn-sm" id="del-btn" onclick="deleteSelected()" style="display:none"><i class="fa-solid fa-trash"></i> (<span id="sel-count">0</span>)</button>
       <button class="btn btn-ghost btn-sm" id="zip-sel-btn" onclick="zipSelected()" style="display:none"><i class="fa-solid fa-file-zipper"></i></button>
       <button class="btn btn-ghost btn-sm" id="clear-sel-btn" onclick="clearSelection()" style="display:none"><i class="fa-solid fa-xmark"></i></button>
@@ -643,6 +652,67 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
+<!-- Chmod Modal -->
+<div class="modal-backdrop" id="chmod-modal">
+  <div class="modal" style="width: 420px;">
+    <div class="modal-header">
+      <div class="modal-title"><i class="fa-solid fa-shield-halved"></i> File Permissions</div>
+      <button class="close-btn" onclick="closeModal('chmod-modal')"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="modal-body">
+      <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+        <div>
+          <div class="form-label" style="margin-bottom: 8px;">Owner</div>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="or" onchange="updateOctal()"> Read
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="ow" onchange="updateOctal()"> Write
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="ox" onchange="updateOctal()"> Execute
+          </label>
+        </div>
+        <div>
+          <div class="form-label" style="margin-bottom: 8px;">Group</div>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="gr" onchange="updateOctal()"> Read
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="gw" onchange="updateOctal()"> Write
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="gx" onchange="updateOctal()"> Execute
+          </label>
+        </div>
+        <div>
+          <div class="form-label" style="margin-bottom: 8px;">Others</div>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="pr" onchange="updateOctal()"> Read
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="pw" onchange="updateOctal()"> Write
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px;">
+            <input type="checkbox" id="px" onchange="updateOctal()"> Execute
+          </label>
+        </div>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Octal Notation</label>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <input type="text" class="form-input" id="chmod-octal-input" value="0644" style="width: 80px; text-align: center; font-weight: 600;" oninput="octalToChecks()">
+          <span id="chmod-symbolic" style="font-family: monospace; font-size: 13px; color: var(--text2); background: var(--surface); padding: 6px 12px; border-radius: var(--radius); border: 1px solid var(--border);">rw-r--r--</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal('chmod-modal')">Cancel</button>
+      <button class="btn btn-primary" onclick="applyChmod()">Apply</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let currentPath = '', currentItems = [], currentView = 'grid', multiSelect = false, selected = new Set(), sortField = 'name', sortAsc = true, remoteMode = false, remoteCwd = '/', editingPath = '', pendingFiles = [], renameTarget = '', currentPreviewPath = '';
 
@@ -662,6 +732,25 @@ function api(action, data={}, isUpload=false) {
 }
 
 async function load(path) {
+  // Dynamic rotate animation for refresh icon
+  const refreshIcon = document.querySelector('.fa-arrows-rotate');
+  if (refreshIcon) {
+    refreshIcon.classList.add('spin-animation');
+    setTimeout(() => refreshIcon.classList.remove('spin-animation'), 600);
+  }
+
+  // Clear search input if navigating to a normal path
+  if (path !== undefined) {
+    document.getElementById('search-input').value = '';
+  } else {
+    // If it's a refresh click (path is undefined), check if search is active
+    const q = document.getElementById('search-input').value.trim();
+    if (q) {
+      doSearch(q);
+      return;
+    }
+  }
+
   if (remoteMode) {
     if (path !== undefined) remoteCwd = path;
     const res = await api('list');
@@ -825,6 +914,16 @@ function updateSelectionUI() {
   document.getElementById('sel-count').textContent = n;
 }
 function clearSelection() { selected.clear(); document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => x.classList.remove('selected')); updateSelectionUI(); }
+function selectAll() {
+  selected.clear();
+  currentItems.forEach(item => {
+    const fullRelPath = remoteMode ? remoteCwd + '/' + item.name : (currentPath ? currentPath + '/' + item.name : item.name);
+    selected.add(fullRelPath);
+  });
+  render();
+  updateSelectionUI();
+  showToast('All items selected', 'success');
+}
 function toggleMultiSelect() {
   multiSelect = !multiSelect;
   const btn = document.getElementById('sel-btn');
