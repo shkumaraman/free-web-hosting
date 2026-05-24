@@ -564,7 +564,15 @@ input,textarea{font-family:inherit}
     <div id="breadcrumb"></div>
     <div id="file-area" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
       <div id="drop-overlay"><i class="fa-solid fa-cloud-arrow-up"></i> Drop files to upload</div>
-      <div id="list-header" class="list-header" style="display:none"></div>
+      <div id="list-header" class="list-header" style="display:none">
+        <div><input type="checkbox" id="header-select-all" onclick="toggleSelectAll(this)"></div>
+        <div></div>
+        <div class="hdr-sort" style="cursor:pointer" data-sort="name" onclick="handleSort('name')">Name</div>
+        <div class="hdr-sort" style="cursor:pointer" data-sort="mtime" onclick="handleSort('mtime')">Modified</div>
+        <div class="hdr-sort" style="cursor:pointer" data-sort="size" onclick="handleSort('size')">Size</div>
+        <div class="hdr-sort" style="cursor:pointer" data-sort="perms" onclick="handleSort('perms')">Perms</div>
+        <div class="hdr-sort" style="cursor:pointer" data-sort="ext" onclick="handleSort('ext')">Type</div>
+      </div>
       <div id="file-list" class="grid"></div>
     </div>
     <div id="statusbar">
@@ -823,6 +831,11 @@ function render(items) {
     if (el.dataset.sort === sortField) el.classList.add(sortAsc ? 'sort-asc' : 'sort-desc');
   });
 
+  const headerCb = document.getElementById('header-select-all');
+  if (headerCb) {
+    headerCb.checked = currentItems.length > 0 && selected.size === currentItems.length;
+  }
+
   if (!sorted.length) {
     list.className = '';
     list.innerHTML = `<div class="empty-state"><i class="fa-solid fa-folder-open"></i><p>Empty folder</p></div>`;
@@ -864,7 +877,11 @@ function handleClick(e, item, path, el) {
     rangeSelect(path);
   } else {
     selected.clear();
-    document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => x.classList.remove('selected'));
+    document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => {
+      x.classList.remove('selected');
+      const cb = x.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = false;
+    });
     toggleSelect(path, el);
   }
   updateSelectionUI();
@@ -872,9 +889,7 @@ function handleClick(e, item, path, el) {
 
 document.getElementById('file-area').addEventListener('click', function(e) {
   if (e.target === this || e.target.id === 'drop-overlay' || e.target.closest('#drop-overlay')) {
-    selected.clear();
-    document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => x.classList.remove('selected'));
-    updateSelectionUI();
+    clearSelection();
   }
 });
 
@@ -888,6 +903,12 @@ function toggleSelect(path, el) {
     el && el.classList.add('selected');
     if (el) { const cb = el.querySelector('input[type=checkbox]'); if (cb) cb.checked = true; }
   }
+  
+  const headerCb = document.getElementById('header-select-all');
+  if (headerCb) {
+    headerCb.checked = currentItems.length > 0 && selected.size === currentItems.length;
+  }
+  
   updateSelectionUI();
 }
 
@@ -902,6 +923,7 @@ function rangeSelect(path) {
     selected.add(p);
     const el = document.querySelector(`[data-path="${CSS.escape(p)}"]`);
     el && el.classList.add('selected');
+    if (el) { const cb = el.querySelector('input[type=checkbox]'); if (cb) cb.checked = true; }
   });
   updateSelectionUI();
 }
@@ -913,7 +935,17 @@ function updateSelectionUI() {
   document.getElementById('clear-sel-btn').style.display = n ? '' : 'none';
   document.getElementById('sel-count').textContent = n;
 }
-function clearSelection() { selected.clear(); document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => x.classList.remove('selected')); updateSelectionUI(); }
+function clearSelection() {
+  selected.clear();
+  document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => {
+    x.classList.remove('selected');
+    const cb = x.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = false;
+  });
+  const headerCb = document.getElementById('header-select-all');
+  if (headerCb) headerCb.checked = false;
+  updateSelectionUI();
+}
 function selectAll() {
   selected.clear();
   currentItems.forEach(item => {
@@ -921,6 +953,8 @@ function selectAll() {
     selected.add(fullRelPath);
   });
   render();
+  const headerCb = document.getElementById('header-select-all');
+  if (headerCb) headerCb.checked = true;
   updateSelectionUI();
   showToast('All items selected', 'success');
 }
@@ -930,7 +964,29 @@ function toggleMultiSelect() {
   btn.style.background = multiSelect ? 'var(--acc-glow)' : '';
   btn.style.borderColor = multiSelect ? 'var(--acc)' : '';
   btn.style.color = multiSelect ? 'var(--acc)' : '';
-  if (!multiSelect) { selected.clear(); render(); updateSelectionUI(); }
+  if (!multiSelect) {
+    selected.clear();
+    const headerCb = document.getElementById('header-select-all');
+    if (headerCb) headerCb.checked = false;
+    render();
+    updateSelectionUI();
+  }
+}
+function handleSort(field) {
+  if (sortField === field) {
+    sortAsc = !sortAsc;
+  } else {
+    sortField = field;
+    sortAsc = true;
+  }
+  render();
+}
+function toggleSelectAll(cb) {
+  if (cb.checked) {
+    selectAll();
+  } else {
+    clearSelection();
+  }
 }
 function handleDblClick(item, path) {
   if (item.is_dir) { load(path); return; }
