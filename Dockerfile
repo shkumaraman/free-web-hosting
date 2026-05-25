@@ -52,7 +52,19 @@ RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
 \$cfg['CookieSameSite'] = 'None';
 EOF
 
-RUN find /etc/php* -name php.ini -exec sh -c 'echo "session.cookie_secure = On" >> "{}" && echo "session.cookie_samesite = \"None\"" >> "{}" && echo "opcache.enable=1" >> "{}" && echo "session.save_path=\"/tmp\"" >> "{}" && echo "sys_temp_dir=\"/tmp\"" >> "{}" && echo "upload_tmp_dir=\"/tmp\"" >> "{}" && echo "upload_max_filesize=512M" >> "{}" && echo "post_max_size=512M" >> "{}"' \;
+RUN find /etc/php* -name php.ini -exec sh -c '\
+    echo "session.cookie_secure = On" >> "{}" && \
+    echo "session.cookie_samesite = \"None\"" >> "{}" && \
+    echo "opcache.enable=1" >> "{}" && \
+    echo "session.save_path=\"/tmp\"" >> "{}" && \
+    echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
+    echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
+    echo "upload_max_filesize=512M" >> "{}" && \
+    echo "post_max_size=512M" >> "{}" && \
+    echo "memory_limit=512M" >> "{}" && \
+    echo "max_execution_time=300" >> "{}" && \
+    echo "log_errors=On" >> "{}" && \
+    echo "error_log=error_log" >> "{}"' \;
 
 RUN mkdir -p /run/mysqld /run/apache2 /data/mysql /var/www/localhost/htdocs /usr/share/webapps/filemanager /etc/apache2/conf.d /var/log/apache2 && \
     ln -sf /dev/stdout /var/log/apache2/access.log && \
