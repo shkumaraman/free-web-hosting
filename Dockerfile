@@ -59,10 +59,10 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "session.save_path=\"/tmp\"" >> "{}" && \
     echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
-    echo "upload_max_filesize=512M" >> "{}" && \
-    echo "post_max_size=512M" >> "{}" && \
-    echo "memory_limit=512M" >> "{}" && \
-    echo "max_execution_time=300" >> "{}" && \
+    echo "upload_max_filesize=5G" >> "{}" && \
+    echo "post_max_size=5G" >> "{}" && \
+    echo "memory_limit=2G" >> "{}" && \
+    echo "max_execution_time=600" >> "{}" && \
     echo "log_errors=On" >> "{}" && \
     echo "error_log=error_log" >> "{}"' \;
 
