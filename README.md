@@ -8,6 +8,7 @@
 <img src="https://img.shields.io/badge/Apache-Web%20Server-D22128?style=for-the-badge&logo=apache&logoColor=white" />
 <img src="https://img.shields.io/badge/MariaDB-Database-003545?style=for-the-badge&logo=mariadb&logoColor=white" />
 <img src="https://img.shields.io/badge/Alpine-Linux-0D597F?style=for-the-badge&logo=alpine-linux&logoColor=white" />
+<img src="https://img.shields.io/badge/FFmpeg-Included-007808?style=for-the-badge&logo=ffmpeg&logoColor=white" />
 <img src="https://img.shields.io/badge/Hugging%20Face-Spaces-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" />
 <img src="https://img.shields.io/badge/Cloudflare-Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white" />
 <img src="https://img.shields.io/badge/Web%20Terminal-Integrated-4d4d4d?style=for-the-badge&logo=gnu-bash&logoColor=white" />
@@ -17,7 +18,7 @@
 
 ### ⚡ Lightweight · 🔒 Secure · 🚀 Production-Ready
 
-> A complete PHP development environment packed into a **single Docker container** — Apache, PHP 8+, MariaDB, phpMyAdmin, and a File Manager with an integrated Web Terminal.  
+> A complete PHP development environment packed into a **single Docker container** — Apache, PHP 8+, MariaDB, phpMyAdmin, FFmpeg, and a File Manager with an integrated Web Terminal.  
 > Deploy on **Hugging Face Spaces** for free, or on any **VPS / local machine**.
 
 </div>
@@ -49,8 +50,9 @@
 | 🐘 **PHP 8+** | With OPcache pre-enabled — runs 2x–3x faster out of the box |
 | 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
+| 🎥 **FFmpeg** | Pre-installed for instant video, audio, and multimedia processing |
 | 📁 **File Manager** | File Manager Pro at `/files` |
-| � **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
+| 💻 **Web Terminal** | Browser-based shell integrated into the File Manager — no SSH needed |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount **required** — database is stored here |
 | 🔒 **Non-root** | Runs as user `1000` for improved security |
@@ -62,7 +64,9 @@
 
 ## 📦 What's Inside
 
+
 ```
+
 Alpine Linux (latest)
 ├── Apache 2           → Web server (port 7860)
 ├── PHP 8.4
@@ -70,8 +74,10 @@ Alpine Linux (latest)
 ├── phpMyAdmin         → Database UI at /sql
 ├── File Manager       → Custom File Manager Pro at /files
 ├── Web Terminal       → Integrated into File Manager at /files
+├── FFmpeg             → Multimedia processing suite
 ├── Composer           → PHP dependency manager
-├── Git, Nano, Wget, Zip, Unzip, ImageMagick
+├── Git, Nano, Wget, Zip, Unzip, ImageMagick, FFmpeg
+
 ```
 
 ### 🐘 PHP Extensions
@@ -144,25 +150,28 @@ Alpine Linux (latest)
 
 Only the `Dockerfile` is needed in your Space repository:
 
+
 ```
+
 your-space/
 └── Dockerfile    ✅ this is the only file needed here
+
 ```
 
 > 💡 Drag & drop the `Dockerfile` in the **Files tab**, or push via Git:
 
 ```bash
-git clone https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME
+git clone [https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME](https://huggingface.co/spaces/YOUR_USERNAME/YOUR_SPACE_NAME)
 cd YOUR_SPACE_NAME
 
 # Only add the Dockerfile here
 git add Dockerfile
 git commit -m "Add Dockerfile"
 git push
+
 ```
 
-> ⚠️ **Do NOT place your project files here.**  
-> Once the Space is live, upload your project files using the **File Manager** at `/files`.  
+> ⚠️ **Do NOT place your project files here.** > Once the Space is live, upload your project files using the **File Manager** at `/files`.
 > Simply go to `/files` → navigate to `/var/www/localhost/htdocs` → upload your files there.
 
 ### Step 3 — Set Environment Variables
@@ -174,7 +183,7 @@ On Hugging Face, environment variables are configured in **Space Settings** — 
 3. Add these variables:
 
 | Variable | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `MYSQL_USER` | `admin` | Database username |
 | `MYSQL_PASSWORD` | `admin` | Database password *(change this!)* |
 | `MYSQL_DATABASE` | `admin` | Database name |
@@ -186,8 +195,9 @@ On Hugging Face, environment variables are configured in **Space Settings** — 
 > **This step is mandatory** — without it, your database will reset on every restart.
 
 Go to Space **Settings → Persistent Storage** and add:
-- **Permission:** Read & Write
-- **Mount path:** `/data`
+
+* **Permission:** Read & Write
+* **Mount path:** `/data`
 
 Full setup details → [Persistent Storage section](#-persistent-storage)
 
@@ -197,6 +207,7 @@ Hugging Face will build and deploy automatically. Your live URL:
 
 ```
 https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
+
 ```
 
 ---
@@ -207,15 +218,16 @@ https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
 
 ### Prerequisites
 
-- Docker installed → [Get Docker](https://docs.docker.com/get-docker/)
+* Docker installed → [Get Docker](https://docs.docker.com/get-docker/)
 
 ### Step 1 — Clone & Build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
 cd YOUR_REPO_NAME
 
 docker build -t php-lamp .
+
 ```
 
 ### Option A — Docker Run
@@ -228,6 +240,7 @@ docker run -d \
   -e MYSQL_DATABASE=mydb \
   --name php-lamp \
   php-lamp
+
 ```
 
 ### Option B — Docker Compose *(Recommended for VPS)*
@@ -246,10 +259,12 @@ services:
       - MYSQL_PASSWORD=yourpassword
       - MYSQL_DATABASE=mydb
     restart: unless-stopped
+
 ```
 
 ```bash
 docker compose up -d
+
 ```
 
 ### Access Your Server
@@ -257,19 +272,23 @@ docker compose up -d
 ```
 http://localhost:7860/      → Local machine
 http://YOUR_VPS_IP:7860/   → Remote VPS
+
 ```
 
 > ⚠️ **On VPS:** Open port `7860` in your firewall first:
 > ```bash
 > sudo ufw allow 7860   # Ubuntu / Debian
+> 
 > ```
+> 
+> 
 
 ---
 
 ## 🌐 Access URLs
 
 | Tool | Default URL | Env Variable |
-|---|---|---|
+| --- | --- | --- |
 | 🏠 **Website** | `/` | — |
 | 🗄️ **Database UI** | `/sql` | `SQL_PATH` |
 | 📁 **File Manager** | `/files` | `FILES_PATH` |
@@ -290,6 +309,7 @@ Password : admin
 Database : admin
 Host     : 127.0.0.1
 Port     : 3306
+
 ```
 
 > ⚠️ **Change the password before going live on a public server!**
@@ -317,7 +337,7 @@ MariaDB stores all its data at `/data/mysql` inside the container. If `/data` is
 3. Configure it as follows:
 
 | Field | Value |
-|---|---|
+| --- | --- |
 | **Permission** | Read & Write |
 | **Mount path** | `/data` |
 | **Visibility** | **Private** *(your data stays secure)* |
@@ -336,6 +356,7 @@ mariadb-install-db --datadir=/data/mysql --skip-test-db --user=1000
 
 # Every run — starts MariaDB using /data/mysql as datadir
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1
+
 ```
 
 > 💡 You don't need to run these manually — `start.sh` does it automatically.
@@ -352,6 +373,7 @@ Place a `.env` file in your web root:
 
 ```
 /var/www/localhost/htdocs/.env
+
 ```
 
 The server automatically loads it at startup, before Apache and MariaDB start. All variables are then available to your PHP app via `getenv()` or `$_ENV`.
@@ -370,6 +392,7 @@ MAIL_HOST=smtp.mailtrap.io
 MAIL_PORT=587
 MAIL_USERNAME=your@email.com
 MAIL_PASSWORD=yourpassword
+
 ```
 
 ### Accessing Variables in PHP
@@ -380,15 +403,16 @@ $stripe   = getenv('STRIPE_KEY');
 
 // Or via $_ENV superglobal
 $debug = $_ENV['APP_DEBUG'];
+
 ```
 
 ### ⚠️ Important Rules
 
-- One variable per line — `KEY=value` format
-- Use `#` for comments — `# this is a comment`
-- **No spaces** around `=` — `KEY=value` ✅ &nbsp; `KEY = value` ❌
-- **No inline comments** — `KEY=value # comment` ❌ (comment becomes part of value)
-- **Never commit `.env` to Git** — add it to `.gitignore`
+* One variable per line — `KEY=value` format
+* Use `#` for comments — `# this is a comment`
+* **No spaces** around `=` — `KEY=value` ✅   `KEY = value` ❌
+* **No inline comments** — `KEY=value # comment` ❌ (comment becomes part of value)
+* **Never commit `.env` to Git** — add it to `.gitignore`
 
 > 💡 `.env` variables are loaded **after** the `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_DATABASE` env vars set in Space Settings — so they can override them if needed.
 
@@ -400,10 +424,9 @@ This setup uses a **File Manager Pro** — accessible at `/files`.
 
 > 🔒 **Security Tip:** To keep your files secure, **change the default URL** by setting the `FILES_PATH` environment variable in your Space Settings to something secret (e.g., `FILES_PATH=my-secret-files`).
 
+## Web Terminal
 
-##  Web Terminal
-
-A PHP-powered browser shell is integrated directly into the File Manager — no SSH required. 
+A PHP-powered browser shell is integrated directly into the File Manager — no SSH required.
 
 To access it, open the **File Manager** (`/files`) and click the **Terminal** button in the top navigation bar.
 
@@ -412,7 +435,8 @@ To access it, open the **File Manager** (`/files`) and click the **Terminal** bu
 ```bash
 free -h        # RAM usage (Total / Used / Free)
 df -h          # Total disk storage
-du -sh *       # File sizes in current folder
+du -sh * # File sizes in current folder
+
 ```
 
 ### 📂 File Navigation
@@ -421,6 +445,7 @@ du -sh *       # File sizes in current folder
 pwd            # Current directory
 ls -la         # List files with permissions
 cd folder      # Navigate into a folder
+
 ```
 
 ### 🛠️ Developer Commands
@@ -429,8 +454,10 @@ cd folder      # Navigate into a folder
 php -v         # Check PHP version
 composer -v    # Check Composer version
 git --version  # Check Git version
+ffmpeg -version# Check FFmpeg version
 unzip file.zip # Extract a zip archive
 nano file.php  # Edit a file in terminal
+
 ```
 
 ---
@@ -442,8 +469,9 @@ nano file.php  # Edit a file in terminal
 This method uses a **Cloudflare Worker** as a reverse proxy. All traffic hits your domain first, gets forwarded to your HF Space, and the response is served back — visitors never see the `*.hf.space` URL.
 
 **Prerequisites:**
-- A domain added to Cloudflare (with DNS managed by Cloudflare)
-- A free Cloudflare account → [cloudflare.com](https://cloudflare.com)
+
+* A domain added to Cloudflare (with DNS managed by Cloudflare)
+* A free Cloudflare account → [cloudflare.com](https://cloudflare.com)
 
 ---
 
@@ -581,11 +609,11 @@ export default {
     }
   },
 };
+
 ```
 
-4. **Important:** Replace `YOUR_USERNAME-YOUR_SPACE_NAME.hf.space` on line 6 with your actual HF Space URL.  
-   For example: `shkumaraman-backend.hf.space`
-
+4. **Important:** Replace `YOUR_USERNAME-YOUR_SPACE_NAME.hf.space` on line 6 with your actual HF Space URL.
+For example: `shkumaraman-backend.hf.space`
 5. Click **"Deploy"** ✅
 
 ---
@@ -614,9 +642,12 @@ You need to complete **both** parts below — Simple domain mapping AND the Rout
 2. This time select **"Route"**
 3. The **"Advanced URL matching"** section appears
 4. In the **Route pattern** field — it will **auto-fill** with:
-   ```
-   *.yourdomain.com/*
-   ```
+```
+*[.yourdomain.com/](https://.yourdomain.com/)*
+
+```
+
+
 5. Click **"Add domain"** ✅
 
 > 💡 The `*.yourdomain.com/*` pattern covers all subdomains and all paths automatically. Do not change it unless you need a more specific rule.
@@ -628,9 +659,10 @@ You need to complete **both** parts below — Simple domain mapping AND the Rout
 Your custom domain now proxies all traffic to your Hugging Face Space.
 
 ```
-https://yourdomain.com/        → Your website
-https://yourdomain.com/sql     → phpMyAdmin
-https://yourdomain.com/files   → File Manager
+[https://yourdomain.com/](https://yourdomain.com/)        → Your website
+[https://yourdomain.com/sql](https://yourdomain.com/sql)     → phpMyAdmin
+[https://yourdomain.com/files](https://yourdomain.com/files)   → File Manager
+
 ```
 
 The original `*.hf.space` URL still works too — the Worker doesn't disable it, it just adds your custom domain on top.
@@ -640,7 +672,7 @@ The original `*.hf.space` URL still works too — the Worker doesn't disable it,
 ### 🔐 What the Worker Does (Security Overview)
 
 | Feature | What it does |
-|---|---|
+| --- | --- |
 | **Proxy** | Forwards all requests to your HF Space and returns the response |
 | **URL masking** | Rewrites `Location` headers on redirects so visitors stay on your domain |
 | **Cookie handling** | Strips `Domain` and `SameSite` attributes so cookies work cross-domain |
@@ -652,34 +684,38 @@ The original `*.hf.space` URL still works too — the Worker doesn't disable it,
 ### 🛠️ Troubleshooting
 
 **Domain not routing to the worker?**
-- Make sure your domain's nameservers are pointing to Cloudflare
-- Check that the route pattern matches your domain exactly
-- Wait a few minutes after saving — changes propagate quickly but not instantly
+
+* Make sure your domain's nameservers are pointing to Cloudflare
+* Check that the route pattern matches your domain exactly
+* Wait a few minutes after saving — changes propagate quickly but not instantly
 
 **Getting a Cloudflare error page?**
-- Double-check the `backendHost` in the worker code — it must match your exact HF Space URL (no `https://`, no trailing slash)
-- Make sure your HF Space is running and accessible directly at `your-username-your-space.hf.space`
+
+* Double-check the `backendHost` in the worker code — it must match your exact HF Space URL (no `https://`, no trailing slash)
+* Make sure your HF Space is running and accessible directly at `your-username-your-space.hf.space`
 
 **Cookies or sessions not working?**
-- The worker already handles cookie rewriting. If issues persist, try clearing browser cookies for your domain.
+
+* The worker already handles cookie rewriting. If issues persist, try clearing browser cookies for your domain.
 
 **Worker only needed on one subdomain?**
-- Change the route pattern to `app.yourdomain.com/*` instead of `*.yourdomain.com/*`
-- Make sure a DNS record exists for that subdomain (add an `A` record pointing to `192.0.2.1` as a placeholder — Cloudflare's proxy will intercept it before it reaches that IP)
+
+* Change the route pattern to `app.yourdomain.com/*` instead of `*.yourdomain.com/*`
+* Make sure a DNS record exists for that subdomain (add an `A` record pointing to `192.0.2.1` as a placeholder — Cloudflare's proxy will intercept it before it reaches that IP)
 
 ---
 
 ## 💡 Pro Tips
 
-- 📂 **Website Root:** Place your project files at `/var/www/localhost/htdocs`
-- 💾 **Persistent Storage Required:** Mount `/data` in Space Settings — without it, database resets on every restart
-- 🗜️ **Fast Deploys:** Upload a `.zip` via File Manager and extract it directly on the server
-- ⚡ **OPcache:** Already enabled — PHP apps run 2x–3x faster with zero extra config
-- 🔒 **Going Public?** Change `FILES_PATH` and `SQL_PATH` to secret URLs and set a strong `MYSQL_PASSWORD`
-- 🛠️ **Composer & Git** are pre-installed — install PHP packages directly from the terminal
-- 🖥️ **No SSH Needed:** The Web Terminal handles all server management from your browser
-- 🔄 **mod_rewrite:** Enabled by default — Laravel, WordPress, and other frameworks work out of the box
-- 🔀 **Custom Domain:** Use a Cloudflare Worker to mask your HF Space URL with your own domain — completely free
+* 📂 **Website Root:** Place your project files at `/var/www/localhost/htdocs`
+* 💾 **Persistent Storage Required:** Mount `/data` in Space Settings — without it, database resets on every restart
+* 🗜️ **Fast Deploys:** Upload a `.zip` via File Manager and extract it directly on the server
+* ⚡ **OPcache:** Already enabled — PHP apps run 2x–3x faster with zero extra config
+* 🔒 **Going Public?** Change `FILES_PATH` and `SQL_PATH` to secret URLs and set a strong `MYSQL_PASSWORD`
+* 🛠️ **Composer & Git** are pre-installed — install PHP packages directly from the terminal
+* 🖥️ **No SSH Needed:** The Web Terminal handles all server management from your browser
+* 🔄 **mod_rewrite:** Enabled by default — Laravel, WordPress, and other frameworks work out of the box
+* 🔀 **Custom Domain:** Use a Cloudflare Worker to mask your HF Space URL with your own domain — completely free
 
 ---
 
@@ -695,10 +731,6 @@ Contributions, issues, and feature requests are welcome!
 
 ---
 
-<div align="center">
-
 **Made with ❤️ for developers who love simplicity**
 
 ⭐ **If this helped you, please give it a Star!** ⭐
-
-</div>
