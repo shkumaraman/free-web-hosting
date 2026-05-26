@@ -19,7 +19,7 @@ RUN apk add --no-cache \
     php-pdo php-sodium php-ftp php-calendar \
     php-pcntl php-gettext php-shmop php-sysvmsg \
     php-sysvsem php-sysvshm php-tidy php-xsl php-bz2 php-gmp readline wget \
-    git composer nano tini
+    git composer nano tini ffmpeg
 
 RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/#LoadModule rewrite_module/LoadModule rewrite_module/' /etc/apache2/httpd.conf && \
