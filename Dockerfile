@@ -19,7 +19,7 @@ RUN apk add --no-cache \
     php-pdo php-sodium php-ftp php-calendar \
     php-pcntl php-gettext php-shmop php-sysvmsg \
     php-sysvsem php-sysvshm php-tidy php-xsl php-bz2 php-gmp readline wget \
-    git composer nano tini ffmpeg
+    git composer nano tini ffmpeg libarchive-tools
 
 RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/#LoadModule rewrite_module/LoadModule rewrite_module/' /etc/apache2/httpd.conf && \
@@ -94,6 +94,8 @@ if [ ! -d /data/htdocs ]; then
     mkdir -p /data/htdocs || true
 fi
 
+chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps 2>/dev/null || true
+
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
     rm -rf /var/www/localhost/htdocs 2>/dev/null || true
@@ -137,6 +139,10 @@ until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/de
 done
 
 rm -f /tmp/init.sql
+
+chown -R 1000:1000 /data/htdocs 2>/dev/null || true
+chmod -R 755 /data/htdocs 2>/dev/null || true
+
 exec httpd -D FOREGROUND
 EOF
 
