@@ -33,11 +33,6 @@ RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     AllowOverride All\n\
     Require all granted\n\
 </Directory>\n\
-<Directory /usr/share/webapps/sys-error>\n\
-    Options FollowSymLinks\n\
-    AllowOverride All\n\
-    Require all granted\n\
-</Directory>\n\
 <Directory /var/www/localhost/htdocs>\n\
     Options Indexes FollowSymLinks\n\
     IndexOptions FancyIndexing FoldersFirst NameWidth=* DescriptionWidth=* VersionSort\n\
@@ -49,12 +44,6 @@ DirectoryIndex index.php index.html\n" >> /etc/apache2/httpd.conf
 RUN cat > /etc/apache2/conf.d/tool-aliases.conf << 'APACHECONF'
 Alias /sql /usr/share/webapps/phpmyadmin
 Alias /files /usr/share/webapps/filemanager
-Alias /sys-error /usr/share/webapps/sys-error
-ErrorDocument 400 /sys-error/error.php
-ErrorDocument 401 /sys-error/error.php
-ErrorDocument 403 /sys-error/error.php
-ErrorDocument 404 /sys-error/error.php
-ErrorDocument 500 /sys-error/error.php
 APACHECONF
 
 RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
@@ -111,14 +100,11 @@ RUN mkdir -p \
     /data/htdocs \
     /var/www/localhost/htdocs \
     /usr/share/webapps/filemanager \
-    /usr/share/webapps/sys-error \
     /etc/apache2/conf.d \
     /var/log/apache2 && \
     ln -sf /dev/stdout /var/log/apache2/access.log && \
     ln -sf /dev/stderr /var/log/apache2/error.log && \
     curl -fsSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php && \
-    curl -fsSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/error/error.php -o /usr/share/webapps/sys-error/error.php || true && \
-    if [ ! -s /usr/share/webapps/sys-error/error.php ] || grep -q "404: Not Found" /usr/share/webapps/sys-error/error.php; then printf "<?php \$s=\$_SERVER['REDIRECT_STATUS']??404; echo '<h1>Error '.\$s.'</h1><hr><address>Apache Server</address>'; ?>" > /usr/share/webapps/sys-error/error.php; fi && \
     test -s /usr/share/webapps/filemanager/index.php && \
     rm -f /var/www/localhost/htdocs/index.html /var/www/localhost/htdocs/index.php
 
