@@ -97,6 +97,11 @@ RUN cd /usr/share/webapps/filemanager && \
     composer require phpseclib/phpseclib && \
     composer clear-cache
 
+RUN cat > /etc/apache2/conf.d/tool-aliases.conf << 'APACHECONF'
+Alias /sql /usr/share/webapps/phpmyadmin
+Alias /files /usr/share/webapps/filemanager
+APACHECONF
+
 RUN chown -R 1000:1000 \
     /run/mysqld /run/apache2 \
     /var/www/localhost \
@@ -104,7 +109,8 @@ RUN chown -R 1000:1000 \
     /etc/phpmyadmin \
     /etc/apache2/conf.d \
     /usr/share/webapps \
-    /data
+    /data \
+    /tmp
 
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
@@ -113,8 +119,6 @@ rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /dat
 if [ ! -d /data/htdocs ]; then
     mkdir -p /data/htdocs || true
 fi
-
-chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps 2>/dev/null || true
 
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
@@ -127,11 +131,6 @@ if [ -f /var/www/localhost/htdocs/.env ]; then
     . /var/www/localhost/htdocs/.env || true
     set +a
 fi
-
-cat > /etc/apache2/conf.d/tool-aliases.conf << APACHECONF
-Alias /${SQL_PATH:-sql} /usr/share/webapps/phpmyadmin
-Alias /${FILES_PATH:-files} /usr/share/webapps/filemanager
-APACHECONF
 
 if [ ! -d /data/mysql/mysql ]; then
     find /data/mysql -mindepth 1 -delete 2>/dev/null || true
@@ -162,7 +161,7 @@ rm -f /tmp/init.sql
 
 CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
 
-if [ -n "$CREATE_TABLES_SQL" ] && [ ! -d /data/mysql/phpmyadmin ]; then
+if [ -n "$CREATE_TABLES_SQL" ]; then
     mariadb --socket=/run/mysqld/mysqld.sock -u root < "$CREATE_TABLES_SQL" || true
 fi
 
@@ -172,13 +171,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO '${MYSQL_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
 
-chown -R 1000:1000 /data/htdocs 2>/dev/null || true
 chmod -R 755 /data/htdocs 2>/dev/null || true
 
 exec httpd -D FOREGROUND
 EOF
 
-RUN chmod +x /start.sh
+RUN chmod +x /start.sh && \
+    chown 1000:1000 /start.sh
 
 WORKDIR /var/www/localhost/htdocs
 USER 1000
