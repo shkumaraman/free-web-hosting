@@ -2,7 +2,9 @@ FROM alpine:latest
 
 ENV MYSQL_USER=admin \
     MYSQL_PASSWORD=admin \
-    MYSQL_DATABASE=admin
+    MYSQL_DATABASE=admin \
+    SQL_PATH=sql \
+    FILES_PATH=files
 
 RUN apk add --no-cache \
     mariadb mariadb-client apache2 php-apache2 \
@@ -41,11 +43,6 @@ RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
 </Directory>\n\
 DirectoryIndex index.php index.html\n" >> /etc/apache2/httpd.conf
 
-RUN cat > /etc/apache2/conf.d/tool-aliases.conf << 'APACHECONF'
-Alias /sql /usr/share/webapps/phpmyadmin
-Alias /files /usr/share/webapps/filemanager
-APACHECONF
-
 RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
     sed -i "s|'localhost'|'127.0.0.1'|g" /etc/phpmyadmin/config.inc.php && \
     cat << EOF >> /etc/phpmyadmin/config.inc.php
@@ -73,7 +70,6 @@ RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
 \$cfg['Servers'][1]['designer_settings'] = 'pma__designer_settings';
 \$cfg['Servers'][1]['export_templates'] = 'pma__export_templates';
 \$cfg['TrustedProxies'] = array('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.1');
-\$cfg['PmaAbsoluteUri'] = './sql/';
 \$cfg['CookieSameSite'] = 'None';
 EOF
 
@@ -132,6 +128,8 @@ if [ ! -d /data/htdocs ]; then
     mkdir -p /data/htdocs
 fi
 
+chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps 2>/dev/null || true
+
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
     rm -rf /var/www/localhost/htdocs 2>/dev/null || true
@@ -143,6 +141,11 @@ if [ -f /var/www/localhost/htdocs/.env ]; then
     . /var/www/localhost/htdocs/.env || true
     set +a
 fi
+
+cat > /etc/apache2/conf.d/tool-aliases.conf << APACHECONF
+Alias /${SQL_PATH:-sql} /usr/share/webapps/phpmyadmin
+Alias /${FILES_PATH:-files} /usr/share/webapps/filemanager
+APACHECONF
 
 if [ ! -d /data/mysql/mysql ]; then
     find /data/mysql -mindepth 1 -delete 2>/dev/null || true
