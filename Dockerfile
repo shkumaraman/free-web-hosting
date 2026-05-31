@@ -117,47 +117,10 @@ RUN mkdir -p \
     ln -sf /dev/stdout /var/log/apache2/access.log && \
     ln -sf /dev/stderr /var/log/apache2/error.log && \
     curl -fsSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php && \
+    curl -fsSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/error/error.php -o /usr/share/webapps/error/error.php || true && \
+    if [ ! -s /usr/share/webapps/error/error.php ] || grep -q "404: Not Found" /usr/share/webapps/error/error.php; then printf "<?php \$s=\$_SERVER['REDIRECT_STATUS']??404; echo '<h1>Error '.\$s.'</h1><hr><address>Apache Server</address>'; ?>" > /usr/share/webapps/error/error.php; fi && \
     test -s /usr/share/webapps/filemanager/index.php && \
     rm -f /var/www/localhost/htdocs/index.html /var/www/localhost/htdocs/index.php
-
-RUN cat << 'PHP' > /usr/share/webapps/error/error.php
-<?php
-$status = $_SERVER['REDIRECT_STATUS'] ?? 404;
-$codes = [
-    400 => ['Bad Request', 'Your browser sent a request that this server could not understand.'],
-    401 => ['Unauthorized', 'This server could not verify that you are authorized to access the document requested.'],
-    403 => ['Forbidden', 'You do not have permission to access this resource.'],
-    404 => ['Not Found', 'The requested URL was not found on this server.'],
-    500 => ['Internal Server Error', 'The server encountered an internal error or misconfiguration and was unable to complete your request.']
-];
-$errTitle = $codes[$status][0] ?? 'Error';
-$errDesc = $codes[$status][1] ?? 'An error occurred while processing your request.';
-?>
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title><?php echo $status; ?> <?php echo htmlspecialchars($errTitle); ?></title>
-<style>
-body{margin:0;font-family:Arial,sans-serif;background:#f1f5f9;color:#334155;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center;padding:20px}
-.box{max-width:550px;background:#ffffff;padding:40px 30px;border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,0.05);border-top:6px solid #ef4444}
-h1{font-size:48px;margin:0 0 10px;color:#1e293b}
-h2{font-size:22px;margin:0 0 15px;color:#64748b;font-weight:500}
-p{font-size:15px;line-height:1.6;color:#64748b;margin:0 0 30px}
-.footer{font-size:12px;color:#94a3b8;border-top:1px solid #e2e8f0;padding-top:20px;font-family:monospace}
-</style>
-</head>
-<body>
-<div class="box">
-<h1><?php echo $status; ?></h1>
-<h2><?php echo htmlspecialchars($errTitle); ?></h2>
-<p><?php echo htmlspecialchars($errDesc); ?></p>
-<div class="footer">Apache Server at <?php echo htmlspecialchars($_SERVER['HTTP_HOST'] ?? 'localhost'); ?></div>
-</div>
-</body>
-</html>
-PHP
 
 RUN cd /usr/share/webapps/filemanager && \
     composer require phpseclib/phpseclib && \
