@@ -47,6 +47,26 @@ RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
 \$cfg['blowfish_secret'] = '${BLOWFISH}';
 \$cfg['Servers'][1]['host'] = '127.0.0.1';
 \$cfg['Servers'][1]['port'] = '3306';
+\$cfg['Servers'][1]['pmadb'] = 'phpmyadmin';
+\$cfg['Servers'][1]['bookmarktable'] = 'pma__bookmark';
+\$cfg['Servers'][1]['relation'] = 'pma__relation';
+\$cfg['Servers'][1]['table_info'] = 'pma__table_info';
+\$cfg['Servers'][1]['table_coords'] = 'pma__table_coords';
+\$cfg['Servers'][1]['pdf_pages'] = 'pma__pdf_pages';
+\$cfg['Servers'][1]['column_info'] = 'pma__column_info';
+\$cfg['Servers'][1]['history'] = 'pma__history';
+\$cfg['Servers'][1]['table_uiprefs'] = 'pma__table_uiprefs';
+\$cfg['Servers'][1]['tracking'] = 'pma__tracking';
+\$cfg['Servers'][1]['userconfig'] = 'pma__userconfig';
+\$cfg['Servers'][1]['recent'] = 'pma__recent';
+\$cfg['Servers'][1]['favorite'] = 'pma__favorite';
+\$cfg['Servers'][1]['users'] = 'pma__users';
+\$cfg['Servers'][1]['usergroups'] = 'pma__usergroups';
+\$cfg['Servers'][1]['navigationhiding'] = 'pma__navigationhiding';
+\$cfg['Servers'][1]['savedsearches'] = 'pma__savedsearches';
+\$cfg['Servers'][1]['central_columns'] = 'pma__central_columns';
+\$cfg['Servers'][1]['designer_settings'] = 'pma__designer_settings';
+\$cfg['Servers'][1]['export_templates'] = 'pma__export_templates';
 \$cfg['TrustedProxies'] = array('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.1');
 \$cfg['PmaAbsoluteUri'] = './';
 \$cfg['CookieSameSite'] = 'None';
@@ -139,6 +159,18 @@ until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/de
 done
 
 rm -f /tmp/init.sql
+
+CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
+
+if [ -n "$CREATE_TABLES_SQL" ] && [ ! -d /data/mysql/phpmyadmin ]; then
+    mariadb --socket=/run/mysqld/mysqld.sock -u root < "$CREATE_TABLES_SQL" || true
+fi
+
+mariadb --socket=/run/mysqld/mysqld.sock -u root << SQL
+CREATE DATABASE IF NOT EXISTS phpmyadmin;
+GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO '${MYSQL_USER}'@'%';
+FLUSH PRIVILEGES;
+SQL
 
 chown -R 1000:1000 /data/htdocs 2>/dev/null || true
 chmod -R 755 /data/htdocs 2>/dev/null || true
