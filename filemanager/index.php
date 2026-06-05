@@ -5,13 +5,22 @@ require_once __DIR__ . '/vendor/autoload.php';
 
 function get_absolute_path($path) {
     global $base_dir;
-    $path = str_replace(['../', '..\\'], '', $path);
-    $real = realpath($base_dir . '/' . ltrim($path, '/'));
-    if ($real === false && !file_exists($base_dir . '/' . ltrim($path, '/'))) {
-        return $base_dir . '/' . ltrim($path, '/');
+    $base = rtrim(str_replace('\\', '/', realpath($base_dir)), '/');
+    $path = str_replace('\\', '/', $path);
+    $parts = explode('/', $path);
+    $safe = [];
+    foreach ($parts as $p) {
+        if ($p === '..') {
+            array_pop($safe);
+        } elseif ($p !== '.' && $p !== '') {
+            $safe[] = $p;
+        }
     }
-    if ($real !== false && strpos($real, $base_dir) !== 0) return $base_dir;
-    return $real !== false ? $real : $base_dir . '/' . ltrim($path, '/');
+    $finalPath = rtrim($base . '/' . implode('/', $safe), '/');
+    if (strpos($finalPath, $base) !== 0) {
+        return $base;
+    }
+    return $finalPath ?: $base;
 }
 
 function get_relative_path($path) {
@@ -49,6 +58,43 @@ function sftp_connect() {
         return $sftp;
     } catch (Exception $e) {
         return false;
+    }
+}
+
+function rrmdir($dir) {
+    if (is_dir($dir)) {
+        $objects = scandir($dir);
+        foreach ($objects as $object) {
+            if ($object != "." && $object != "..") {
+                if (is_dir($dir . DIRECTORY_SEPARATOR . $object) && !is_link($dir . "/" . $object)) {
+                    rrmdir($dir . DIRECTORY_SEPARATOR . $object);
+                } else {
+                    unlink($dir . DIRECTORY_SEPARATOR . $object);
+                }
+            }
+        }
+        rmdir($dir);
+    } else {
+        if(file_exists($dir)) unlink($dir);
+    }
+}
+
+function rcopy($src, $dst) {
+    if (is_dir($src)) {
+        @mkdir($dst);
+        $dir = opendir($src);
+        while (false !== ($file = readdir($dir))) {
+            if (($file != '.') && ($file != '..')) {
+                if (is_dir($src . '/' . $file)) {
+                    rcopy($src . '/' . $file, $dst . '/' . $file);
+                } else {
+                    copy($src . '/' . $file, $dst . '/' . $file);
+                }
+            }
+        }
+        closedir($dir);
+    } else {
+        copy($src, $dst);
     }
 }
 
@@ -137,23 +183,14 @@ if (isset($_GET['api'])) {
                 echo json_encode(['status' => 'success', 'path' => $remote_cwd, 'items' => $items]);
                 exit;
             }
-            if ($action === 'download') {
+            if ($action === 'download' || $action === 'preview') {
                 $req = json_decode(file_get_contents('php://input'), true) ?: [];
                 $file = $req['path'] ?? $target_path;
                 if ($sftp->is_file($file)) {
-                    header('Content-Type: application/octet-stream');
-                    header('Content-Disposition: attachment; filename="' . basename($file) . '"');
-                    header('Content-Length: ' . $sftp->size($file));
-                    echo $sftp->get($file);
-                }
-                exit;
-            }
-            if ($action === 'preview') {
-                $req = json_decode(file_get_contents('php://input'), true) ?: [];
-                $file = $req['path'] ?? $target_path;
-                if ($sftp->is_file($file)) {
-                    $mime = get_mime($file);
+                    $mime = $action === 'preview' ? get_mime($file) : 'application/octet-stream';
                     header('Content-Type: ' . $mime);
+                    if ($action === 'download') header('Content-Disposition: attachment; filename="' . basename($file) . '"');
+                    header('Content-Length: ' . $sftp->size($file));
                     echo $sftp->get($file);
                 }
                 exit;
@@ -228,13 +265,20 @@ if (isset($_GET['api'])) {
         }
         if ($action === 'upload' && !empty($_FILES['files'])) {
             $uploaded = [];
+            $failed = [];
             foreach ($_FILES['files']['name'] as $key => $name) {
-                $dest = $current_path . '/' . basename($name);
-                if (move_uploaded_file($_FILES['files']['tmp_name'][$key], $dest)) {
-                    $uploaded[] = $name;
+                if ($_FILES['files']['error'][$key] === UPLOAD_ERR_OK) {
+                    $dest = $current_path . '/' . basename($name);
+                    if (move_uploaded_file($_FILES['files']['tmp_name'][$key], $dest)) {
+                        $uploaded[] = $name;
+                    } else {
+                        $failed[] = $name;
+                    }
+                } else {
+                    $failed[] = $name;
                 }
             }
-            echo json_encode(['status' => 'success', 'uploaded' => $uploaded]);
+            echo json_encode(['status' => 'success', 'uploaded' => $uploaded, 'failed' => $failed]);
             exit;
         }
         $req = json_decode(file_get_contents('php://input'), true);
@@ -246,9 +290,7 @@ if (isset($_GET['api'])) {
             file_put_contents($current_path . '/' . basename($req['name']), '');
         } elseif ($action === 'delete') {
             foreach ((array)$req['paths'] as $p) {
-                $target = get_absolute_path($p);
-                if (is_dir($target)) shell_exec("rm -rf " . escapeshellarg($target));
-                else unlink($target);
+                rrmdir(get_absolute_path($p));
             }
         } elseif ($action === 'rename') {
             rename(get_absolute_path($req['old']), get_absolute_path($req['new']));
@@ -257,11 +299,21 @@ if (isset($_GET['api'])) {
                 $src = get_absolute_path($p);
                 $dst = get_absolute_path($req['dst']) . '/' . basename($src);
                 if ($action === 'move') rename($src, $dst);
-                else shell_exec("cp -r " . escapeshellarg($src) . " " . escapeshellarg($dst));
+                else rcopy($src, $dst);
             }
         } elseif ($action === 'read') {
             $target = get_absolute_path($req['path']);
             echo json_encode(['status' => 'success', 'content' => file_get_contents($target), 'mime' => get_mime($target)]);
+            exit;
+        } elseif ($action === 'download' || $action === 'preview') {
+            $target = get_absolute_path($req['path'] ?? '');
+            if (is_file($target)) {
+                $mime = $action === 'preview' ? get_mime($target) : 'application/octet-stream';
+                header('Content-Type: ' . $mime);
+                if ($action === 'download') header('Content-Disposition: attachment; filename="' . basename($target) . '"');
+                header('Content-Length: ' . filesize($target));
+                readfile($target);
+            }
             exit;
         } elseif ($action === 'save') {
             $target = get_absolute_path($req['path']);
@@ -270,12 +322,33 @@ if (isset($_GET['api'])) {
             $paths = (array)$req['paths'];
             $zipName = $req['name'] ?? (basename($paths[0]) . '.zip');
             $zipPath = $current_path . '/' . $zipName;
-            $args = implode(' ', array_map(fn($p) => escapeshellarg(basename(get_absolute_path($p))), $paths));
-            shell_exec("cd " . escapeshellarg($current_path) . " && zip -r " . escapeshellarg($zipPath) . " " . $args);
+            $zip = new ZipArchive();
+            if ($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
+                foreach ($paths as $p) {
+                    $target = get_absolute_path($p);
+                    if (is_dir($target)) {
+                        $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($target), RecursiveIteratorIterator::LEAVES_ONLY);
+                        foreach ($files as $name => $file) {
+                            if (!$file->isDir()) {
+                                $filePath = $file->getRealPath();
+                                $relativePath = substr($filePath, strlen($target) + 1);
+                                $zip->addFile($filePath, basename($target) . '/' . $relativePath);
+                            }
+                        }
+                    } else {
+                        $zip->addFile($target, basename($target));
+                    }
+                }
+                $zip->close();
+            }
         } elseif ($action === 'unzip') {
             $target = get_absolute_path($req['path']);
             $dest = dirname($target);
-            shell_exec("unzip -o " . escapeshellarg($target) . " -d " . escapeshellarg($dest));
+            $zip = new ZipArchive();
+            if ($zip->open($target) === TRUE) {
+                $zip->extractTo($dest);
+                $zip->close();
+            }
         } elseif ($action === 'search') {
             $query = strtolower($req['query'] ?? '');
             $results = [];
@@ -588,7 +661,6 @@ input,textarea{font-family:inherit}
 <div id="ctx-menu"></div>
 <div id="toast-wrap"></div>
 
-<!-- Terminal Modal -->
 <div class="modal-backdrop" id="terminal-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title"><i class="fa-solid fa-terminal"></i> Terminal</div><button class="close-btn" onclick="closeModal('terminal-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -599,7 +671,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- SFTP Modal -->
 <div class="modal-backdrop" id="sftp-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title"><i class="fa-solid fa-network-wired"></i> SFTP Connection</div><button class="close-btn" onclick="closeModal('sftp-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -613,7 +684,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Prompt Modal -->
 <div class="modal-backdrop" id="prompt-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title" id="prompt-title"></div><button class="close-btn" onclick="closeModal('prompt-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -622,7 +692,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Rename Modal -->
 <div class="modal-backdrop" id="rename-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title">Rename</div><button class="close-btn" onclick="closeModal('rename-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -631,7 +700,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Editor Modal -->
 <div class="modal-backdrop" id="editor-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title" id="editor-title"></div><button class="close-btn" onclick="closeModal('editor-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -640,7 +708,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Upload Modal -->
 <div class="modal-backdrop" id="upload-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title">Upload Files</div><button class="close-btn" onclick="closeModal('upload-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -655,7 +722,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Preview Modal -->
 <div class="modal-backdrop" id="preview-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title" id="preview-title"></div><button class="close-btn" onclick="closeModal('preview-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -663,7 +729,6 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
-<!-- Chmod Modal -->
 <div class="modal-backdrop" id="chmod-modal">
   <div class="modal" style="width: 420px;">
     <div class="modal-header">
@@ -727,34 +792,25 @@ input,textarea{font-family:inherit}
 <script>
 let currentPath = '', currentItems = [], currentView = 'grid', multiSelect = false, selected = new Set(), sortField = 'name', sortAsc = true, remoteMode = false, remoteCwd = '/', editingPath = '', pendingFiles = [], renameTarget = '', currentPreviewPath = '';
 
-function api(action, data={}, isUpload=false) {
+function api(action, data={}) {
   const url = `?api=${action}&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`;
   if (action === 'list' || action === 'diskusage') return fetch(url).then(r => r.json());
   const opts = { method: 'POST' };
-  if (isUpload) {
-    const fd = new FormData();
-    for (const f of data) fd.append('files[]', f);
-    opts.body = fd;
-  } else {
-    opts.headers = { 'Content-Type': 'application/json' };
-    opts.body = JSON.stringify(data);
-  }
+  opts.headers = { 'Content-Type': 'application/json' };
+  opts.body = JSON.stringify(data);
   return fetch(url, opts).then(r => r.json());
 }
 
 async function load(path) {
-  // Dynamic rotate animation for refresh icon
   const refreshIcon = document.querySelector('.fa-arrows-rotate');
   if (refreshIcon) {
     refreshIcon.classList.add('spin-animation');
     setTimeout(() => refreshIcon.classList.remove('spin-animation'), 600);
   }
 
-  // Clear search input if navigating to a normal path
   if (path !== undefined) {
     document.getElementById('search-input').value = '';
   } else {
-    // If it's a refresh click (path is undefined), check if search is active
     const q = document.getElementById('search-input').value.trim();
     if (q) {
       doSearch(q);
@@ -938,6 +994,7 @@ function updateSelectionUI() {
   document.getElementById('clear-sel-btn').style.display = n ? '' : 'none';
   document.getElementById('sel-count').textContent = n;
 }
+
 function clearSelection() {
   selected.clear();
   document.querySelectorAll('.file-card.selected,.file-row.selected').forEach(x => {
@@ -949,6 +1006,7 @@ function clearSelection() {
   if (headerCb) headerCb.checked = false;
   updateSelectionUI();
 }
+
 function selectAll() {
   selected.clear();
   currentItems.forEach(item => {
@@ -960,6 +1018,7 @@ function selectAll() {
   if (headerCb) headerCb.checked = true;
   updateSelectionUI();
 }
+
 function toggleMultiSelect() {
   multiSelect = !multiSelect;
   const btn = document.getElementById('sel-btn');
@@ -974,6 +1033,7 @@ function toggleMultiSelect() {
     updateSelectionUI();
   }
 }
+
 function handleSort(field) {
   if (sortField === field) {
     sortAsc = !sortAsc;
@@ -983,6 +1043,7 @@ function handleSort(field) {
   }
   render();
 }
+
 function toggleSelectAll(cb) {
   if (cb.checked) {
     selectAll();
@@ -990,6 +1051,7 @@ function toggleSelectAll(cb) {
     clearSelection();
   }
 }
+
 function handleDblClick(item, path) {
   if (item.is_dir) { load(path); return; }
   const ext = (item.ext || '').toLowerCase();
@@ -1001,7 +1063,9 @@ function handleDblClick(item, path) {
   else if (text.includes(ext) || item.size < 2*1024*1024) openEditor(path, item.name);
   else openPreview(item, path);
 }
+
 function navUp() { const parts = (remoteMode ? remoteCwd : currentPath).split('/').filter(p => p); parts.pop(); load(parts.join('/')); }
+
 function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
   const base = remoteMode ? remoteCwd : currentPath;
@@ -1015,11 +1079,13 @@ function renderBreadcrumb() {
   bc.innerHTML = html;
   document.getElementById('sb-path').textContent = '/' + base;
 }
+
 function updateStatusBar() {
   const dirs = currentItems.filter(i => i.is_dir).length;
   const files = currentItems.length - dirs;
   document.getElementById('sb-items').textContent = `${dirs} folder${dirs!==1?'s':''}, ${files} file${files!==1?'s':''}`;
 }
+
 function showCtx(e, item, path) {
   e.preventDefault(); e.stopPropagation();
   if (!selected.has(path)) {
@@ -1052,12 +1118,15 @@ function showCtx(e, item, path) {
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
 }
+
 document.addEventListener('click', () => { document.getElementById('ctx-menu').style.display = 'none'; });
 document.addEventListener('keydown', e => { if (e.key==='Escape') { closeAllModals(); document.getElementById('ctx-menu').style.display='none'; } });
+
 function currentItemByPath(path) {
   const name = path.split('/').pop();
   return currentItems.find(i => i.name === name) || {name,ext:'',is_dir:false,size:0,mtime:0,perms:'0644'};
 }
+
 function promptAction(action) {
   const modal = document.getElementById('prompt-modal');
   document.getElementById('prompt-input').value = '';
@@ -1083,13 +1152,16 @@ function promptAction(action) {
   openModal('prompt-modal');
   setTimeout(() => document.getElementById('prompt-input').focus(), 100);
 }
+
 function promptConfirm() { window._promptAction && window._promptAction(); }
+
 async function deleteSelected() {
   if (!selected.size) return;
   if (!confirm(`Delete ${selected.size} item(s)?`)) return;
   await api('delete', {paths:[...selected]});
   selected.clear(); load(); showToast('Deleted','success');
 }
+
 function openRename(path, name) {
   renameTarget = path;
   document.getElementById('rename-input').value = name;
@@ -1101,6 +1173,7 @@ function openRename(path, name) {
     inp.setSelectionRange(0, dot > 0 ? dot : name.length);
   }, 100);
 }
+
 async function doRename() {
   const newName = document.getElementById('rename-input').value.trim();
   if (!newName) return;
@@ -1109,6 +1182,7 @@ async function doRename() {
   await api('rename', {old:renameTarget, new:newPath});
   closeModal('rename-modal'); load(); showToast('Renamed','success');
 }
+
 function openMoveCopyModal(mode) {
   if (!selected.size) return;
   const dst = prompt(`Destination (relative):`, currentPath);
@@ -1117,6 +1191,7 @@ function openMoveCopyModal(mode) {
     if (r.status === 'success') { selected.clear(); load(); showToast(mode==='move'?'Moved':'Copied','success'); }
   });
 }
+
 async function zipSelected() {
   if (!selected.size) return;
   const name = prompt('ZIP file name:', [...selected][0].split('/').pop() + '.zip');
@@ -1124,21 +1199,25 @@ async function zipSelected() {
   await api('zip', {paths:[...selected], name});
   load(); showToast('ZIP created','success');
 }
+
 async function doUnzip(path) {
   await api('unzip', {path});
   load(); showToast('Extracted','success');
 }
+
 function openChmod(path, perms) {
   chmodTarget = path;
   document.getElementById('chmod-octal-input').value = perms;
   octalToChecks();
   openModal('chmod-modal');
 }
+
 async function applyChmod() {
   const perms = document.getElementById('chmod-octal-input').value;
   await api('chmod', {path:chmodTarget, perms});
   closeModal('chmod-modal'); load(); showToast('Permissions updated','success');
 }
+
 function updateOctal() {
   const ids = ['or','ow','ox','gr','gw','gx','pr','pw','px'];
   const vals = ids.map(id => document.getElementById(id).checked ? 1 : 0);
@@ -1146,6 +1225,7 @@ function updateOctal() {
   document.getElementById('chmod-octal-input').value = '0' + o;
   updateSymbolic('0' + o);
 }
+
 function octalToChecks() {
   let v = document.getElementById('chmod-octal-input').value.replace(/^0/,'');
   if (!/^[0-7]{3}$/.test(v)) return;
@@ -1158,12 +1238,14 @@ function octalToChecks() {
   });
   updateSymbolic('0'+v);
 }
+
 function updateSymbolic(octal) {
   const v = octal.replace(/^0/,'');
   if (!/^[0-7]{3}$/.test(v)) return;
   const s = v.split('').map(d => (d&4?'r':'-')+(d&2?'w':'-')+(d&1?'x':'-')).join('');
   document.getElementById('chmod-symbolic').textContent = s;
 }
+
 function updateEditorLineNumbers() {
   const textarea = document.getElementById('code-editor');
   const lines = textarea.value.split('\n').length;
@@ -1173,9 +1255,11 @@ function updateEditorLineNumbers() {
   lineNumDiv.innerHTML = html;
   lineNumDiv.scrollTop = textarea.scrollTop;
 }
+
 document.getElementById('code-editor').addEventListener('scroll', function() {
   document.getElementById('line-numbers').scrollTop = this.scrollTop;
 });
+
 async function openEditor(path, name) {
   const res = await api('read', {path});
   if (res.status !== 'success') { showToast('Cannot open file','error'); return; }
@@ -1185,6 +1269,7 @@ async function openEditor(path, name) {
   updateEditorLineNumbers();
   openModal('editor-modal');
 }
+
 async function saveFile() {
   const content = document.getElementById('code-editor').value;
   const res = await api('save', {path:editingPath, content});
@@ -1192,18 +1277,20 @@ async function saveFile() {
   else showToast('Save failed','error');
   updateEditorLineNumbers();
 }
+
 function editorChanged() {
   const title = document.getElementById('editor-title');
   if (!title.textContent.endsWith('*')) title.textContent += '*';
   updateEditorLineNumbers();
 }
+
 function openPreview(item, path) {
   currentPreviewPath = path;
   const ext = (item.ext || '').toLowerCase();
   const wrap = document.getElementById('preview-content');
   document.getElementById('preview-title').textContent = item.name;
   wrap.innerHTML = '<div style="text-align:center;padding:30px"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>';
-  fetch(`?api=preview`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})})
+  fetch(`?api=preview&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})})
     .then(r => r.blob())
     .then(blob => {
       const url = URL.createObjectURL(blob);
@@ -1221,97 +1308,124 @@ function openPreview(item, path) {
     });
   openModal('preview-modal');
 }
+
 function downloadFile(path) {
-  fetch(`?api=download`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})})
+  fetch(`?api=download&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})})
     .then(r => r.blob())
     .then(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = path.split('/').pop(); a.click(); });
 }
+
 function openUpload() { pendingFiles = []; renderUploadList(); openModal('upload-modal'); }
+
 function fileInputChanged(files) {
   pendingFiles = [...pendingFiles, ...files];
   renderUploadList();
   document.getElementById('file-input').value = '';
 }
+
 function renderUploadList() {
   const ul = document.getElementById('upload-list');
   const btn = document.getElementById('upload-btn');
   ul.innerHTML = pendingFiles.map(f => `<div class="upload-item"><i class="fa-solid fa-file"></i><span class="ui-name">${escHtml(f.name)}</span><span class="ui-size">${fmtSize(f.size)}</span><span class="ui-status">Ready</span></div>`).join('');
   btn.disabled = pendingFiles.length === 0 || btn.dataset.busy === '1';
 }
+
 function clearUploadQueue() {
   if (document.getElementById('upload-btn').dataset.busy === '1') return;
   pendingFiles = [];
   document.getElementById('file-input').value = '';
   renderUploadList();
 }
-async function doUpload() {
+
+function doUpload() {
   if (!pendingFiles.length) return;
   const btn = document.getElementById('upload-btn');
   const list = document.getElementById('upload-list');
   btn.dataset.busy = '1';
   btn.disabled = true;
   btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading';
-  list.querySelectorAll('.ui-status').forEach(el => el.textContent = 'Uploading');
 
-  try {
-    const uploadedPath = remoteMode ? remoteCwd : currentPath;
-    const res = await api('upload', pendingFiles, true);
-    if (res.status === 'success') {
-      const uploaded = new Set(res.uploaded || pendingFiles.map(f => f.name));
-      list.querySelectorAll('.upload-item').forEach((row, index) => {
-        const file = pendingFiles[index];
-        const ok = file && uploaded.has(file.name);
-        row.classList.toggle('done', ok);
-        row.classList.toggle('failed', !ok);
-        const status = row.querySelector('.ui-status');
-        if (status) status.textContent = ok ? 'Uploaded' : 'Skipped';
-      });
-      pendingFiles = [];
-      document.getElementById('file-input').value = '';
-      await load(uploadedPath);
-      openModal('upload-modal');
-    } else {
-      list.querySelectorAll('.upload-item').forEach(row => {
-        row.classList.add('failed');
-        const status = row.querySelector('.ui-status');
-        if (status) status.textContent = 'Failed';
-      });
-      showToast(res.message || 'Upload failed','error');
+  const fd = new FormData();
+  pendingFiles.forEach(f => fd.append('files[]', f));
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', `?api=upload&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`, true);
+
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      list.querySelectorAll('.ui-status').forEach(el => el.textContent = `Uploading ${pct}%`);
     }
-  } catch (err) {
-    list.querySelectorAll('.upload-item').forEach(row => {
-      row.classList.add('failed');
-      const status = row.querySelector('.ui-status');
-      if (status) status.textContent = 'Failed';
-    });
-    showToast('Upload failed','error');
-  } finally {
+  };
+
+  xhr.onload = async function() {
     btn.dataset.busy = '0';
     btn.innerHTML = 'Upload';
     btn.disabled = pendingFiles.length === 0;
-  }
+
+    if (xhr.status === 200) {
+      try {
+        const res = JSON.parse(xhr.responseText);
+        if (res.status === 'success') {
+          const uploaded = new Set(res.uploaded || []);
+          list.querySelectorAll('.upload-item').forEach((row, index) => {
+            const file = pendingFiles[index];
+            const ok = file && uploaded.has(file.name);
+            row.classList.toggle('done', ok);
+            row.classList.toggle('failed', !ok);
+            const status = row.querySelector('.ui-status');
+            if (status) status.textContent = ok ? 'Uploaded' : 'Skipped/Failed';
+          });
+          pendingFiles = [];
+          document.getElementById('file-input').value = '';
+          await load(remoteMode ? remoteCwd : currentPath);
+          setTimeout(() => closeModal('upload-modal'), 1200);
+        } else {
+          showToast(res.message || 'Upload failed', 'error');
+        }
+      } catch(err) {
+        showToast('Invalid response', 'error');
+      }
+    } else {
+      showToast('Upload failed', 'error');
+    }
+  };
+
+  xhr.onerror = function() {
+    btn.dataset.busy = '0';
+    btn.innerHTML = 'Upload';
+    showToast('Network error', 'error');
+  };
+
+  xhr.send(fd);
 }
+
 function uploadDragOver(e) { e.preventDefault(); document.getElementById('upload-drop').classList.add('drag'); }
 function uploadDragLeave(e) { document.getElementById('upload-drop').classList.remove('drag'); }
+
 function uploadDrop(e) {
   e.preventDefault();
   document.getElementById('upload-drop').classList.remove('drag');
   pendingFiles = [...pendingFiles, ...e.dataTransfer.files];
   renderUploadList();
 }
+
 function onDragOver(e) { e.preventDefault(); document.getElementById('drop-overlay').style.display='flex'; }
 function onDragLeave(e) { if (!e.currentTarget.contains(e.relatedTarget)) document.getElementById('drop-overlay').style.display='none'; }
+
 function onDrop(e) {
   e.preventDefault();
   document.getElementById('drop-overlay').style.display='none';
   pendingFiles = [...e.dataTransfer.files];
   if (pendingFiles.length) { renderUploadList(); openModal('upload-modal'); }
 }
+
 function debounceSearch(q) {
   clearTimeout(window._searchTimer);
   if (!q.trim()) { load(currentPath); return; }
   window._searchTimer = setTimeout(() => doSearch(q), 400);
 }
+
 async function doSearch(q) {
   const res = await api('search', {query: q});
   if (res.status !== 'success') return;
@@ -1319,6 +1433,7 @@ async function doSearch(q) {
   render(res.results);
   document.getElementById('sb-items').textContent = `${res.results.length} result${res.results.length!==1?'s':''} for "${q}"`;
 }
+
 function setView(v) {
   currentView = v;
   document.getElementById('vbtn-grid').classList.toggle('active', v==='grid');
@@ -1327,12 +1442,15 @@ function setView(v) {
   document.getElementById('nav-list').classList.toggle('active', v==='list');
   render();
 }
+
 function openModal(id) { document.getElementById(id).classList.add('open'); }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 function closeAllModals() { document.querySelectorAll('.modal-backdrop.open').forEach(m => m.classList.remove('open')); }
+
 document.querySelectorAll('.modal-backdrop').forEach(b => {
   b.addEventListener('click', e => { if (e.target === b) b.classList.remove('open'); });
 });
+
 let toastId = 0;
 function showToast(msg, type='info', duration=3000) {
   const id = ++toastId;
@@ -1351,10 +1469,10 @@ function showToast(msg, type='info', duration=3000) {
   }
   return id;
 }
+
 function removeToast(id) { const el = document.getElementById('toast-'+id); if (el) { el.style.opacity='0'; el.style.transform='translateX(20px)'; el.style.transition='.2s'; setTimeout(()=>el.remove(),200); } }
 function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 
-// Terminal
 function openTerminal() {
   openModal('terminal-modal');
   const output = document.getElementById('terminal-output');
@@ -1367,6 +1485,7 @@ function openTerminal() {
       document.getElementById('terminal-input').focus();
     });
 }
+
 document.getElementById('terminal-input').addEventListener('keypress', function(e) {
   if (e.key === 'Enter') {
     const cmd = this.value.trim();
@@ -1384,8 +1503,8 @@ document.getElementById('terminal-input').addEventListener('keypress', function(
   }
 });
 
-// SFTP
 function promptSFTP() { openModal('sftp-modal'); }
+
 async function sftpConnect() {
   const host = document.getElementById('sftp-host').value.trim();
   const port = document.getElementById('sftp-port').value;
@@ -1403,6 +1522,7 @@ async function sftpConnect() {
     load();
   } else alert('SFTP connection failed: ' + (res.message || ''));
 }
+
 function loadLocalRoot() {
   if (remoteMode) {
     fetch('?api=sftp_disconnect&dir=').then(() => {
@@ -1415,9 +1535,9 @@ function loadLocalRoot() {
     });
   } else load('');
 }
+
 function loadRemote() { load(remoteCwd); }
 
-// Auto-close sidebar on mobile when a nav item is clicked
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     if (window.innerWidth <= 768) {
@@ -1428,6 +1548,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
 
 function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function escJs(s) { return String(s).replace(/'/g,"\\'").replace(/\\/g,'\\\\'); }
+
 function fmtSize(b) {
   if (b >= 1073741824) return (b/1073741824).toFixed(2)+' GB';
   if (b >= 1048576) return (b/1048576).toFixed(2)+' MB';
