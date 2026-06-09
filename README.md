@@ -14,9 +14,9 @@
 <img src="https://img.shields.io/badge/Web%20Terminal-Integrated-4d4d4d?style=for-the-badge&logo=gnu-bash&logoColor=white" />
 <img src="https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge" />
 
-# ðŸ˜ PHP Web Server â€” Alpine LAMP Stack
+# PHP Web Server â€” Alpine LAMP Stack
 
-### âš¡ Lightweight Â· ðŸ”§ Developer-Friendly Â· ðŸš€ HF Spaces Ready
+### Lightweight Â· Developer-Friendly Â· HF Spaces Ready
 
 > A complete PHP development environment packed into a **single Docker container** â€” Apache, PHP 8.x, MariaDB, phpMyAdmin, FFmpeg, and a File Manager with optional integrated Web Terminal support.  
 > Deploy on **Hugging Face Spaces** for free, or on any **VPS / local machine**.
@@ -25,48 +25,48 @@
 
 ---
 
-## ðŸ“‹ Table of Contents
+## Table of Contents
 
-- [âœ¨ Features](#-features)
-- [ðŸ“¦ What's Inside](#-whats-inside)
-- [ðŸ˜ PHP Extensions](#-php-extensions)
-- [â˜ï¸ Deploy on Hugging Face Spaces](#ï¸-deploy-on-hugging-face-spaces) â­ Recommended
-- [ðŸ–¥ï¸ Deploy on VPS / Local Machine](#ï¸-deploy-on-vps--local-machine)
-- [ðŸŒ Access URLs](#-access-urls)
-- [ðŸ—„ï¸ Database Setup](#ï¸-database-setup)
-- [ðŸ’¾ Persistent Storage](#-persistent-storage)
-- [âš™ï¸ Environment Variables & .env](#ï¸-environment-variables--env)
-- [ðŸ“ File Manager](#-file-manager)
-- [ðŸ’» Web Terminal](#-web-terminal)
-- [ðŸ”€ Custom Domain via Cloudflare Workers](#-custom-domain-via-cloudflare-workers)
-- [ðŸ”’ Security Notes](#-security-notes)
-- [ðŸ’¡ Pro Tips](#-pro-tips)
-- [ðŸ¤ Contributing](#-contributing)
+- [Features](#features)
+- [What's Inside](#whats-inside)
+- [PHP Extensions](#php-extensions)
+- [Deploy on Hugging Face Spaces](#deploy-on-hugging-face-spaces) Recommended
+- [Deploy on VPS / Local Machine](#deploy-on-vps--local-machine)
+- [Access URLs](#access-urls)
+- [Database Setup](#database-setup)
+- [Persistent Storage](#persistent-storage)
+- [Environment Variables & .env](#environment-variables--env)
+- [File Manager](#file-manager)
+- [Web Terminal](#web-terminal)
+- [Custom Domain via Cloudflare Workers](#custom-domain-via-cloudflare-workers)
+- [Security Notes](#security-notes)
+- [Pro Tips](#pro-tips)
+- [Contributing](#contributing)
 
 ---
 
-## âœ¨ Features
+## Features
 
 | Feature | Description |
 |---|---|
-| ðŸ˜ **PHP 8.x** | PHP runtime with OPcache pre-enabled for better performance |
-| ðŸŒ **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
-| ðŸ—„ï¸ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
-| ðŸ“ **File Manager** | Custom File Manager at `/files` |
-| ðŸ’» **Web Terminal** | Browser-based shell support through the bundled File Manager |
-| âš™ï¸ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
-| ðŸ’¾ **Persistent Storage** | `/data` mount recommended/required for preserving database and site files |
-| ðŸ”’ **Non-root** | Runs as user `1000` for improved container security |
-| ðŸ³ **Alpine Base** | Lightweight Linux base image |
-| ðŸŽ¬ **FFmpeg** | Audio/video processing toolkit for media workflows |
-| â˜ï¸ **HF Spaces Ready** | Designed for Hugging Face Docker Spaces |
-| ðŸ”€ **Custom Domain** | Optional custom domain proxy via Cloudflare Workers |
+| **PHP 8.x** | PHP runtime with OPcache pre-enabled for better performance |
+| **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
+| **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
+| **File Manager** | Custom File Manager at `/files` |
+| **Web Terminal** | Browser-based shell support through the bundled File Manager |
+| **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
+| **Persistent Storage** | `/data` mount recommended/required for preserving database and site files |
+| **Non-root** | Runs as user `1000` for improved container security |
+| **Alpine Base** | Lightweight Linux base image |
+| **FFmpeg** | Audio/video processing toolkit for media workflows |
+| **HF Spaces Ready** | Designed for Hugging Face Docker Spaces |
+| **Custom Domain** | Optional custom domain proxy via Cloudflare Workers |
 
-> âš ï¸ This image is best suited for development, demos, personal hosting, and small self-hosted apps. If exposed publicly, change all default credentials and hide/protect admin URLs.
+> ï¿½ This image is best suited for development, demos, personal hosting, and small self-hosted apps. If exposed publicly, change all default credentials and hide/protect admin URLs.
 
 ---
 
-## ðŸ“¦ What's Inside
+## What's Inside
 
 ```txt
 Alpine Linux latest
@@ -90,7 +90,7 @@ Alpine Linux latest
 
 ---
 
-## ðŸ˜ PHP Extensions
+## PHP Extensions
 
 | Extension | Purpose |
 |---|---|
@@ -140,9 +140,9 @@ Alpine Linux latest
 
 ---
 
-## â˜ï¸ Deploy on Hugging Face Spaces
+## Deploy on Hugging Face Spaces
 
-> â­ **Recommended** â€” free hosting, no server required.
+> **Recommended** â€” free hosting, no server required.
 
 ### Step 1 â€” Create a New Space
 
@@ -161,7 +161,7 @@ Only the `Dockerfile` is needed in your Space repository:
 
 ```txt
 your-space/
-â””â”€â”€ Dockerfile    âœ… only this file is needed here
+â””â”€â”€ Dockerfile     only this file is needed here
 ```
 
 You can drag and drop the `Dockerfile` in the **Files** tab, or push via Git:
@@ -175,7 +175,7 @@ git commit -m "Add Dockerfile"
 git push
 ```
 
-> âš ï¸ Do **not** place your project files directly in the Space repository.  
+> ï¿½ Do **not** place your project files directly in the Space repository.  
 > Once the Space is live, upload your project using the File Manager at `/files`.
 
 Recommended upload path:
@@ -216,7 +216,7 @@ FILES_PATH=mysecretfiles
 
 ### Step 4 â€” Mount Persistent Storage
 
-> ðŸš¨ This step is highly recommended. Without persistent storage, your database and uploaded files may reset when the Space restarts or rebuilds.
+> This step is highly recommended. Without persistent storage, your database and uploaded files may reset when the Space restarts or rebuilds.
 
 Go to:
 
@@ -244,7 +244,7 @@ https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
 
 ---
 
-## ðŸ–¥ï¸ Deploy on VPS / Local Machine
+## Deploy on VPS / Local Machine
 
 ### Prerequisites
 
@@ -317,13 +317,13 @@ sudo ufw allow 7860
 
 ---
 
-## ðŸŒ Access URLs
+## Access URLs
 
 | Tool | Default URL | Env Variable |
 |---|---|---|
-| ðŸ  **Website** | `/` | â€” |
-| ðŸ—„ï¸ **Database UI** | `/sql` | `SQL_PATH` |
-| ðŸ“ **File Manager** | `/files` | `FILES_PATH` |
+| ï¿½ **Website** | `/` | â€” |
+| **Database UI** | `/sql` | `SQL_PATH` |
+| **File Manager** | `/files` | `FILES_PATH` |
 
 Web root directory:
 
@@ -341,15 +341,15 @@ FILES_PATH=x7k2files
 Then access:
 
 ```txt
-/sql       âŒ no longer used
-/files     âŒ no longer used
-/x7k2mdb   âœ… phpMyAdmin
-/x7k2files âœ… File Manager
+/sql        no longer used
+/files      no longer used
+/x7k2mdb    phpMyAdmin
+/x7k2files  File Manager
 ```
 
 ---
 
-## ðŸ—„ï¸ Database Setup
+## Database Setup
 
 ### Default Credentials
 
@@ -361,7 +361,7 @@ Host     : 127.0.0.1
 Port     : 3306
 ```
 
-> âš ï¸ Change the password before exposing your app publicly.
+> ï¿½ Change the password before exposing your app publicly.
 
 ### How to Change Credentials
 
@@ -404,7 +404,7 @@ echo 'Database connected successfully!';
 
 ---
 
-## ðŸ’¾ Persistent Storage
+## Persistent Storage
 
 MariaDB stores its data at:
 
@@ -442,7 +442,7 @@ Set:
 | **Mount path** | `/data` |
 | **Visibility** | Private |
 
-> ðŸ”’ Keep your Persistent Storage bucket private. It may contain your database and uploaded files.
+> Keep your Persistent Storage bucket private. It may contain your database and uploaded files.
 
 ### What the Container Does Automatically
 
@@ -462,7 +462,7 @@ You do not need to run these manually. The startup script handles it.
 
 ---
 
-## âš™ï¸ Environment Variables & .env
+## Environment Variables & .env
 
 You can configure your PHP app using a `.env` file.
 
@@ -541,7 +541,7 @@ APP_DEBUG=false # production mode
 
 ---
 
-## ðŸ“ File Manager
+## File Manager
 
 The File Manager is available at:
 
@@ -573,11 +573,11 @@ Recommended upload directory:
 /var/www/localhost/htdocs
 ```
 
-> ðŸ”’ Security tip: Change `FILES_PATH` to a hard-to-guess path before exposing your app publicly.
+> Security tip: Change `FILES_PATH` to a hard-to-guess path before exposing your app publicly.
 
 ---
 
-## ðŸ’» Web Terminal
+## Web Terminal
 
 A browser-based terminal is available through the bundled File Manager if terminal support is enabled in that File Manager build.
 
@@ -632,7 +632,7 @@ ffmpeg -i input.mp4 output.mp3
 
 ---
 
-## ðŸ”€ Custom Domain via Cloudflare Workers
+## Custom Domain via Cloudflare Workers
 
 > Serve your Hugging Face Space from your own domain, for example `example.com`, while proxying requests to the original `*.hf.space` backend.
 
@@ -877,7 +877,7 @@ Instead of:
 
 ---
 
-## ðŸ”’ Security Notes
+## Security Notes
 
 Before going public:
 
@@ -902,23 +902,23 @@ FILES_PATH=hidden-file-panel
 
 ---
 
-## ðŸ’¡ Pro Tips
+## Pro Tips
 
-- ðŸ“‚ **Website Root:** Upload your project files to `/var/www/localhost/htdocs`
-- ðŸ’¾ **Persistent Storage:** Mount `/data` so database and files survive restarts
-- ðŸ—œï¸ **Fast Deploys:** Upload a `.zip` through File Manager and extract it on the server
-- âš¡ **OPcache:** Already enabled for better PHP performance
-- ðŸ”’ **Public Hosting:** Change `FILES_PATH`, `SQL_PATH`, and `MYSQL_PASSWORD`
-- ðŸ› ï¸ **Composer & Git:** Installed for dependency management and repository workflows
-- ðŸ–¥ï¸ **No SSH Needed:** Use the File Manager terminal if available
-- ðŸ”„ **mod_rewrite:** Enabled for Laravel, WordPress, and other frameworks
-- ðŸ”€ **Custom Domain:** Use Cloudflare Workers to proxy a custom domain to HF Spaces
-- ðŸŽ¬ **Media Workflows:** FFmpeg is included for audio/video processing
-- ðŸ–¼ï¸ **Image Workflows:** GD and Imagick are included for image processing
+- **Website Root:** Upload your project files to `/var/www/localhost/htdocs`
+- **Persistent Storage:** Mount `/data` so database and files survive restarts
+- **Fast Deploys:** Upload a `.zip` through File Manager and extract it on the server
+- **OPcache:** Already enabled for better PHP performance
+- **Public Hosting:** Change `FILES_PATH`, `SQL_PATH`, and `MYSQL_PASSWORD`
+- ï¿½ **Composer & Git:** Installed for dependency management and repository workflows
+- **No SSH Needed:** Use the File Manager terminal if available
+- **mod_rewrite:** Enabled for Laravel, WordPress, and other frameworks
+- **Custom Domain:** Use Cloudflare Workers to proxy a custom domain to HF Spaces
+- **Media Workflows:** FFmpeg is included for audio/video processing
+- **Image Workflows:** GD and Imagick are included for image processing
 
 ---
 
-## ðŸ¤ Contributing
+## Contributing
 
 Contributions, issues, and feature requests are welcome.
 
@@ -947,8 +947,8 @@ git push origin feature/amazing-feature
 
 <div align="center">
 
-**Made with â¤ï¸ for developers who love simplicity**
+**Made with for developers who love simplicity**
 
-â­ **If this helped you, please give it a Star!** â­
+ **If this helped you, please give it a Star!** 
 
 </div>
