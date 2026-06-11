@@ -135,13 +135,17 @@ RUN chown -R 1000:1000 \
 
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
+# Runtime permissions fix for containers that reset /run
+mkdir -p /run/mysqld /run/apache2
+chown -R 1000:1000 /run/mysqld /run/apache2
+
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /data/mysql/tc.log /tmp/php-fpm.pid 2>/dev/null || true
 
 if [ ! -d /data/htdocs ]; then
     mkdir -p /data/htdocs
 fi
 
-chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps 2>/dev/null || true
+chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps /run/mysqld /run/apache2 2>/dev/null || true
 
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
@@ -176,10 +180,11 @@ SQL
 
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid --skip-networking=OFF --innodb-use-native-aio=0 --init-file=/tmp/init.sql &
 
+# Increased TRIES to 120 (4 minutes timeout allowance for slow recovery)
 TRIES=0
 until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/dev/null; do
     TRIES=$((TRIES+1))
-    if [ "$TRIES" -ge 30 ]; then
+    if [ "$TRIES" -ge 120 ]; then
         cat /data/mysql/*.err 2>/dev/null || true
         exit 1
     fi
