@@ -23,8 +23,16 @@ RUN apk add --no-cache \
 
 RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/#LoadModule rewrite_module/LoadModule rewrite_module/' /etc/apache2/httpd.conf && \
+    sed -i 's/#LoadModule mpm_prefork_module/LoadModule mpm_prefork_module/' /etc/apache2/httpd.conf && \
     sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/httpd.conf && \
     printf "\nServerName localhost\n\
+<IfModule mpm_prefork_module>\n\
+    StartServers             5\n\
+    MinSpareServers          5\n\
+    MaxSpareServers         10\n\
+    MaxRequestWorkers      150\n\
+    MaxConnectionsPerChild   0\n\
+</IfModule>\n\
 <Directory /usr/share/webapps/phpmyadmin>\n\
     Options FollowSymLinks\n\
     AllowOverride All\n\
