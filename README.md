@@ -18,7 +18,7 @@
 
 ### ⚡ Lightweight · 🔧 Developer-Friendly · 🚀 HF Spaces Ready
 
-> A complete PHP development environment packed into a **single Docker container** — Apache, PHP 8.x, MariaDB, phpMyAdmin, FFmpeg, and a File Manager with optional integrated Web Terminal support.  
+> A complete PHP development environment packed into a **single Docker container** — Apache (MPM Event), PHP 8.x (FPM), MariaDB, phpMyAdmin, FFmpeg, and a File Manager with optional integrated Web Terminal support.  
 > Deploy on **Hugging Face Spaces** for free, or on any **VPS / local machine**.
 
 </div>
@@ -49,8 +49,8 @@
 
 | Feature | Description |
 |---|---|
-| 🐘 **PHP 8.x** | PHP runtime with OPcache pre-enabled for better performance |
-| 🌐 **Apache** | Configured with `mod_rewrite` and `.htaccess` support |
+| 🐘 **PHP 8.x (FPM)** | High-performance PHP runtime with OPcache pre-enabled |
+| 🌐 **Apache (MPM Event)** | Configured for concurrent requests with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
 | 📁 **File Manager** | Custom File Manager at `/files` |
 | 💻 **Web Terminal** | Browser-based shell support through the bundled File Manager |
@@ -62,7 +62,7 @@
 | ☁️ **HF Spaces Ready** | Designed for Hugging Face Docker Spaces |
 | 🔀 **Custom Domain** | Optional custom domain proxy via Cloudflare Workers |
 
-> ⚠️ This image is best suited for development, demos, personal hosting, and small self-hosted apps. If exposed publicly, change all default credentials and hide/protect admin URLs.
+> ⚠️ **Resource Warning:** By default, this container is optimized for high performance and allocates ~5GB of RAM for the MariaDB buffer pool. Ensure your server has at least **8GB+ RAM**. If deploying on low-resource environments (1GB/2GB RAM), modify `/etc/my.cnf.d/16gb.cnf` in the Dockerfile before building.
 
 ---
 
@@ -70,8 +70,8 @@
 
 ```txt
 Alpine Linux latest
-├── Apache 2             → Web server on port 7860
-├── PHP 8.x              → PHP runtime with common extensions
+├── Apache 2 (MPM Event) → High-concurrency Web server on port 7860
+├── PHP 8.x (PHP-FPM)    → FastCGI Process Manager with common extensions
 ├── MariaDB              → Database server
 ├── phpMyAdmin           → Database UI at /sql
 ├── File Manager         → Custom File Manager at /files
@@ -219,6 +219,7 @@ https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
 ## 🖥️ Deploy on VPS / Local Machine
 ### Prerequisites
  * Docker installed
+ * Minimum 8GB+ RAM (or adjust the MariaDB configuration in the Dockerfile for lower RAM).
 ### Step 1 — Clone and Build
 ```bash
 git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
@@ -270,7 +271,7 @@ docker compose up -d
 ### Access Your Server
 ```txt
 http://localhost:7860/      → Local machine
-http://YOUR_VPS_IP:7860/   → Remote VPS
+http://YOUR_VPS_IP:7860/    → Remote VPS
 
 ```
 On VPS, open port 7860 in your firewall:
@@ -367,8 +368,8 @@ The container symlinks the Apache web root:
 ### Why /data Matters
 If /data is not mounted as persistent storage:
  * MariaDB may be reinitialized after restart/rebuild
- * uploaded site files may be lost
- * database tables and records may reset
+ * Uploaded site files may be lost
+ * Database tables and records may reset
 ### Hugging Face Persistent Storage
 Set:
 | Field | Value |
@@ -692,9 +693,9 @@ For all subdomains:
  4. Click **Add route**
 ### Step 5 — Access Your App
 ```txt
-[https://example.com/](https://example.com/)        → Website
-[https://example.com/sql](https://example.com/sql)     → phpMyAdmin
-[https://example.com/files](https://example.com/files)   → File Manager
+[https://example.com/](https://example.com/)          → Website
+[https://example.com/sql](https://example.com/sql)       → phpMyAdmin
+[https://example.com/files](https://example.com/files)     → File Manager
 
 ```
 If you customized paths:
