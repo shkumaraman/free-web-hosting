@@ -24,12 +24,25 @@ RUN apk add --no-cache \
 RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/^LoadModule mpm_prefork_module/#LoadModule mpm_prefork_module/' /etc/apache2/httpd.conf && \
     sed -i 's/^LoadModule mpm_worker_module/#LoadModule mpm_worker_module/' /etc/apache2/httpd.conf && \
-    if grep -q '^#LoadModule mpm_event_module' /etc/apache2/httpd.conf; then sed -i 's/^#LoadModule mpm_event_module/LoadModule mpm_event_module/' /etc/apache2/httpd.conf; elif ! grep -q '^LoadModule mpm_event_module' /etc/apache2/httpd.conf; then printf "\nLoadModule mpm_event_module modules/mod_mpm_event.so\n" >> /etc/apache2/httpd.conf; fi && \
-    if grep -q '^#LoadModule proxy_module' /etc/apache2/httpd.conf; then sed -i 's/^#LoadModule proxy_module/LoadModule proxy_module/' /etc/apache2/httpd.conf; elif ! grep -q '^LoadModule proxy_module' /etc/apache2/httpd.conf; then printf "\nLoadModule proxy_module modules/mod_proxy.so\n" >> /etc/apache2/httpd.conf; fi && \
-    if grep -q '^#LoadModule proxy_fcgi_module' /etc/apache2/httpd.conf; then sed -i 's/^#LoadModule proxy_fcgi_module/LoadModule proxy_fcgi_module/' /etc/apache2/httpd.conf; elif ! grep -q '^LoadModule proxy_fcgi_module' /etc/apache2/httpd.conf; then printf "\nLoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so\n" >> /etc/apache2/httpd.conf; fi && \
-    sed -i 's/#LoadModule rewrite_module/LoadModule rewrite_module/' /etc/apache2/httpd.conf && \
+    sed -i '/mod_mpm_event\.so/s/^#//' /etc/apache2/httpd.conf && \
+    sed -i '/mod_proxy\.so/s/^#//' /etc/apache2/httpd.conf && \
+    sed -i '/mod_proxy_fcgi\.so/s/^#//' /etc/apache2/httpd.conf && \
+    sed -i '/mod_rewrite\.so/s/^#//' /etc/apache2/httpd.conf && \
     sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/httpd.conf && \
     printf "\nServerName localhost\n\
+Timeout 60\n\
+KeepAlive On\n\
+MaxKeepAliveRequests 300\n\
+KeepAliveTimeout 2\n\
+ProxyTimeout 600\n\
+<IfModule mpm_event_module>\n\
+    StartServers 4\n\
+    MinSpareThreads 75\n\
+    MaxSpareThreads 250\n\
+    ThreadsPerChild 25\n\
+    MaxRequestWorkers 500\n\
+    MaxConnectionsPerChild 10000\n\
+</IfModule>\n\
 <FilesMatch \\.php$>\n\
     SetHandler \"proxy:fcgi://127.0.0.1:9000/\"\n\
 </FilesMatch>\n\
@@ -54,12 +67,37 @@ DirectoryIndex index.php index.html\n" >> /etc/apache2/httpd.conf
 RUN find /etc/php* -name php-fpm.conf -exec sh -c '\
     sed -i "s|^;*pid = .*|pid = /run/php-fpm/php-fpm.pid|" "$1" && \
     sed -i "s|^;*error_log = .*|error_log = /proc/self/fd/2|" "$1" && \
-    sed -i "s|^;*daemonize = .*|daemonize = yes|" "$1"' sh {} \; && \
+    sed -i "s|^;*daemonize = .*|daemonize = no|" "$1"' sh {} \; && \
     find /etc/php* -path '*/php-fpm.d/www.conf' -exec sh -c '\
+    sed -i "s|^user = .*|user = 1000|" "$1" && \
+    sed -i "s|^group = .*|group = 1000|" "$1" && \
     sed -i "s|^listen = .*|listen = 127.0.0.1:9000|" "$1" && \
+    sed -i "s|^;*listen.allowed_clients = .*|listen.allowed_clients = 127.0.0.1|" "$1" && \
+    sed -i "s|^pm = .*|pm = dynamic|" "$1" && \
+    sed -i "s|^pm.max_children = .*|pm.max_children = 100|" "$1" && \
+    sed -i "s|^pm.start_servers = .*|pm.start_servers = 20|" "$1" && \
+    sed -i "s|^pm.min_spare_servers = .*|pm.min_spare_servers = 10|" "$1" && \
+    sed -i "s|^pm.max_spare_servers = .*|pm.max_spare_servers = 40|" "$1" && \
+    sed -i "s|^;*pm.max_requests = .*|pm.max_requests = 1000|" "$1" && \
+    sed -i "s|^;*request_terminate_timeout = .*|request_terminate_timeout = 600s|" "$1" && \
     sed -i "s|^;*clear_env = .*|clear_env = no|" "$1" && \
     sed -i "s|^;*catch_workers_output = .*|catch_workers_output = yes|" "$1" && \
     sed -i "s|^;*decorate_workers_output = .*|decorate_workers_output = no|" "$1"' sh {} \;
+
+RUN cat << 'EOF' > /etc/my.cnf.d/16gb.cnf
+[mariadb]
+max_connections=300
+thread_cache_size=100
+table_open_cache=4096
+tmp_table_size=256M
+max_heap_table_size=256M
+max_allowed_packet=512M
+innodb_buffer_pool_size=5G
+innodb_log_file_size=512M
+innodb_flush_log_at_trx_commit=2
+innodb_file_per_table=1
+skip-name-resolve
+EOF
 
 RUN BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32) && \
     sed -i "s|'localhost'|'127.0.0.1'|g" /etc/phpmyadmin/config.inc.php && \
@@ -95,6 +133,14 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "session.cookie_secure = On" >> "{}" && \
     echo "session.cookie_samesite = \"None\"" >> "{}" && \
     echo "opcache.enable=1" >> "{}" && \
+    echo "opcache.memory_consumption=256" >> "{}" && \
+    echo "opcache.interned_strings_buffer=32" >> "{}" && \
+    echo "opcache.max_accelerated_files=100000" >> "{}" && \
+    echo "opcache.validate_timestamps=1" >> "{}" && \
+    echo "opcache.revalidate_freq=2" >> "{}" && \
+    echo "opcache.fast_shutdown=1" >> "{}" && \
+    echo "realpath_cache_size=4096K" >> "{}" && \
+    echo "realpath_cache_ttl=600" >> "{}" && \
     echo "session.save_path=\"/tmp\"" >> "{}" && \
     echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
@@ -119,8 +165,8 @@ RUN mkdir -p \
     /var/log/apache2 && \
     ln -sf /dev/stdout /var/log/apache2/access.log && \
     ln -sf /dev/stderr /var/log/apache2/error.log && \
-    curl -fsSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php && \
-    test -s /usr/share/webapps/filemanager/index.php && \
+    curl -f -sSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php && \
+    [ -s /usr/share/webapps/filemanager/index.php ] && \
     rm -f /var/www/localhost/htdocs/index.html /var/www/localhost/htdocs/index.php
 
 RUN cd /usr/share/webapps/filemanager && \
@@ -142,13 +188,24 @@ RUN chown -R 1000:1000 \
 
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
+
+MYSQL_PID=""
+FPM_PID=""
+HTTPD_PID=""
+
+stop_all() {
+    [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
+    [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
+    [ -n "$MYSQL_PID" ] && kill "$MYSQL_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    exit 0
+}
+
+trap stop_all INT TERM
+
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid /data/mysql/tc.log 2>/dev/null || true
 
-if [ ! -d /data/htdocs ]; then
-    mkdir -p /data/htdocs
-fi
-
-mkdir -p /run/php-fpm
+mkdir -p /data/htdocs /run/php-fpm
 
 chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps /run/php-fpm 2>/dev/null || true
 
@@ -179,18 +236,19 @@ FLUSH PRIVILEGES;
 CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-GRANT ALL PRIVILEGES ON *.* TO '${MYSQL_USER}'@'%' WITH GRANT OPTION;
+GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${MYSQL_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
 
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid --skip-networking=OFF --innodb-use-native-aio=0 --init-file=/tmp/init.sql &
+MYSQL_PID="$!"
 
 TRIES=0
 until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/dev/null; do
     TRIES=$((TRIES+1))
     if [ "$TRIES" -ge 30 ]; then
         cat /data/mysql/*.err 2>/dev/null || true
-        exit 1
+        stop_all
     fi
     sleep 2
 done
@@ -217,12 +275,39 @@ chmod -R u+rwX,go+rX /data/htdocs 2>/dev/null || true
 PHP_FPM_BIN="$(command -v php-fpm || find /usr/sbin /usr/bin -maxdepth 1 -type f -name 'php-fpm*' 2>/dev/null | sort | head -n 1)"
 
 if [ -z "$PHP_FPM_BIN" ]; then
-    exit 1
+    stop_all
 fi
 
-"$PHP_FPM_BIN" -D
+"$PHP_FPM_BIN" -F &
+FPM_PID="$!"
 
-exec httpd -D FOREGROUND
+sleep 2
+
+if ! kill -0 "$FPM_PID" 2>/dev/null; then
+    stop_all
+fi
+
+httpd -D FOREGROUND &
+HTTPD_PID="$!"
+
+while true; do
+    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
+        wait "$MYSQL_PID" 2>/dev/null || true
+        stop_all
+    fi
+
+    if ! kill -0 "$FPM_PID" 2>/dev/null; then
+        wait "$FPM_PID" 2>/dev/null || true
+        stop_all
+    fi
+
+    if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
+        wait "$HTTPD_PID" 2>/dev/null || true
+        stop_all
+    fi
+
+    sleep 2
+done
 EOF
 
 RUN chmod +x /start.sh && \
