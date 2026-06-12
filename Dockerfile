@@ -7,7 +7,7 @@ ENV MYSQL_USER=admin \
     FILES_PATH=files
 
 RUN apk add --no-cache \
-    mariadb mariadb-client apache2 apache2-proxy php-fpm \
+    mariadb mariadb-client apache2 php-apache2 \
     php-mysqli php-pdo_mysql php-mbstring php-xml \
     php-gd php-curl php-session phpmyadmin curl \
     zip unzip php-zip php-ctype php-fileinfo \
@@ -23,15 +23,8 @@ RUN apk add --no-cache \
 
 RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/#LoadModule rewrite_module/LoadModule rewrite_module/' /etc/apache2/httpd.conf && \
-    sed -i '/LoadModule mpm_prefork_module/s/^/#/' /etc/apache2/httpd.conf && \
-    sed -i 's/#LoadModule mpm_event_module/LoadModule mpm_event_module/' /etc/apache2/httpd.conf && \
-    sed -i 's/#LoadModule proxy_module/LoadModule proxy_module/' /etc/apache2/httpd.conf && \
-    sed -i 's/#LoadModule proxy_fcgi_module/LoadModule proxy_fcgi_module/' /etc/apache2/httpd.conf && \
     sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/httpd.conf && \
     printf "\nServerName localhost\n\
-<FilesMatch \\.php$>\n\
-    SetHandler \"proxy:fcgi://127.0.0.1:9000\"\n\
-</FilesMatch>\n\
 <Directory /usr/share/webapps/phpmyadmin>\n\
     Options FollowSymLinks\n\
     AllowOverride All\n\
@@ -96,12 +89,6 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "log_errors=On" >> "{}" && \
     echo "error_log=/tmp/php-error.log" >> "{}"' \;
 
-RUN find /etc/php* -name www.conf -exec sed -i 's/user = nobody/user = 1000/g' "{}" \; && \
-    find /etc/php* -name www.conf -exec sed -i 's/group = nobody/group = 1000/g' "{}" \; && \
-    find /etc/php* -name php-fpm.conf -exec sed -i 's|error_log = .*|error_log = /tmp/php-fpm.log|g' "{}" \; && \
-    find /etc/php* -name php-fpm.conf -exec sed -i 's|pid = .*|pid = /tmp/php-fpm.pid|g' "{}" \; && \
-    find /etc/php* -name php-fpm.conf -exec sed -i 's|;daemonize = yes|daemonize = yes|g' "{}" \;
-
 RUN mkdir -p \
     /run/mysqld \
     /run/apache2 \
@@ -135,17 +122,13 @@ RUN chown -R 1000:1000 \
 
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
-# Runtime permissions fix for containers that reset /run
-mkdir -p /run/mysqld /run/apache2
-chown -R 1000:1000 /run/mysqld /run/apache2
-
-rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /data/mysql/tc.log /tmp/php-fpm.pid 2>/dev/null || true
+rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /data/mysql/tc.log 2>/dev/null || true
 
 if [ ! -d /data/htdocs ]; then
     mkdir -p /data/htdocs
 fi
 
-chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps /run/mysqld /run/apache2 2>/dev/null || true
+chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps 2>/dev/null || true
 
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
@@ -180,11 +163,10 @@ SQL
 
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid --skip-networking=OFF --innodb-use-native-aio=0 --init-file=/tmp/init.sql &
 
-# Increased TRIES to 120 (4 minutes timeout allowance for slow recovery)
 TRIES=0
 until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/dev/null; do
     TRIES=$((TRIES+1))
-    if [ "$TRIES" -ge 120 ]; then
+    if [ "$TRIES" -ge 30 ]; then
         cat /data/mysql/*.err 2>/dev/null || true
         exit 1
     fi
@@ -209,11 +191,6 @@ FLUSH PRIVILEGES;
 SQL
 
 chmod -R u+rwX,go+rX /data/htdocs 2>/dev/null || true
-
-FPM_BIN=$(find /usr/sbin -name "php-fpm*" | head -n 1)
-if [ -n "$FPM_BIN" ]; then
-    $FPM_BIN
-fi
 
 exec httpd -D FOREGROUND
 EOF
