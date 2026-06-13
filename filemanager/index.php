@@ -103,9 +103,10 @@ if (isset($_GET['api'])) {
     $action = $_GET['api'];
     $dir = isset($_GET['dir']) ? $_GET['dir'] : '';
     $is_sftp = !empty($_SESSION['sftp_active']);
+    
+    $req = json_decode(file_get_contents('php://input'), true) ?: [];
 
     if ($action === 'terminal') {
-        $req = json_decode(file_get_contents('php://input'), true) ?: [];
         $cwd = $_SESSION['term_cwd'] ?? $base_dir;
         $cmd = trim($req['cmd'] ?? '');
         if (!$cmd) { echo json_encode(['out' => '', 'cwd' => $cwd]); exit; }
@@ -124,7 +125,6 @@ if (isset($_GET['api'])) {
     }
 
     if ($action === 'sftp_connect') {
-        $req = json_decode(file_get_contents('php://input'), true) ?: [];
         $_SESSION['sftp'] = [
             'host' => $req['host'],
             'port' => $req['port'] ?? 22,
@@ -184,7 +184,6 @@ if (isset($_GET['api'])) {
                 exit;
             }
             if ($action === 'download' || $action === 'preview') {
-                $req = json_decode(file_get_contents('php://input'), true) ?: [];
                 $file = $req['path'] ?? $target_path;
                 if ($sftp->is_file($file)) {
                     $mime = $action === 'preview' ? get_mime($file) : 'application/octet-stream';
@@ -281,8 +280,7 @@ if (isset($_GET['api'])) {
             echo json_encode(['status' => 'success', 'uploaded' => $uploaded, 'failed' => $failed]);
             exit;
         }
-        $req = json_decode(file_get_contents('php://input'), true);
-        if (!$req) $req = [];
+
         if ($action === 'mkdir') {
             $path = $current_path . '/' . basename($req['name']);
             mkdir($path, 0755, true);
@@ -384,7 +382,7 @@ if (isset($_GET['api'])) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>File Manager Pro</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@latest/css/all.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@latest/css/all.min.css">
 <style>
 :root {
   --bg: #ffffff; --surface: #f5f6f8; --surface2: #e6e9ef;
@@ -558,8 +556,8 @@ input,textarea{font-family:inherit}
 .empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:200px;color:var(--text2);gap:12px}
 .empty-state i{font-size:48px;opacity:.3}
 .empty-state p{font-size:14px}
-.sort-asc::after{content:' ↑'}
-.sort-desc::after{content:' ↓'}
+.sort-asc::after{content:' \2191'}
+.sort-desc::after{content:' \2193'}
 .sidebar-close{display:none;position:absolute;top:10px;right:14px;background:transparent;border:none;color:var(--text2);font-size:24px;cursor:pointer;z-index:200;padding:4px}
 @media(max-width:768px){
   .sidebar-close{display:block}
