@@ -21,7 +21,12 @@ RUN apk add --no-cache \
     php-sysvsem php-sysvshm php-tidy php-xsl php-bz2 php-gmp \
     readline wget git composer nano tini ffmpeg libarchive-tools
 
-RUN sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
+RUN addgroup -g 1000 appgroup && \
+    adduser -u 1000 -G appgroup -D -s /bin/sh appuser
+
+RUN sed -i 's/^User apache/User appuser/' /etc/apache2/httpd.conf && \
+    sed -i 's/^Group apache/Group appgroup/' /etc/apache2/httpd.conf && \
+    sed -i 's/Listen 80/Listen 7860/' /etc/apache2/httpd.conf && \
     sed -i 's/^LoadModule mpm_prefork_module/#LoadModule mpm_prefork_module/' /etc/apache2/httpd.conf && \
     sed -i 's/^LoadModule mpm_worker_module/#LoadModule mpm_worker_module/' /etc/apache2/httpd.conf && \
     sed -i '/mod_mpm_event\.so/s/^#//' /etc/apache2/httpd.conf && \
@@ -69,8 +74,8 @@ RUN find /etc/php* -name php-fpm.conf -exec sh -c '\
     sed -i "s|^;*error_log = .*|error_log = /proc/self/fd/2|" "$1" && \
     sed -i "s|^;*daemonize = .*|daemonize = no|" "$1"' sh {} \; && \
     find /etc/php* -path '*/php-fpm.d/www.conf' -exec sh -c '\
-    sed -i "s|^user = .*|user = 1000|" "$1" && \
-    sed -i "s|^group = .*|group = 1000|" "$1" && \
+    sed -i "s|^user = .*|user = appuser|" "$1" && \
+    sed -i "s|^group = .*|group = appgroup|" "$1" && \
     sed -i "s|^listen = .*|listen = 127.0.0.1:9000|" "$1" && \
     sed -i "s|^;*listen.allowed_clients = .*|listen.allowed_clients = 127.0.0.1|" "$1" && \
     sed -i "s|^pm = .*|pm = dynamic|" "$1" && \
@@ -169,11 +174,7 @@ RUN mkdir -p \
     [ -s /usr/share/webapps/filemanager/index.php ] && \
     rm -f /var/www/localhost/htdocs/index.html /var/www/localhost/htdocs/index.php
 
-RUN cd /usr/share/webapps/filemanager && \
-    composer require phpseclib/phpseclib && \
-    composer clear-cache
-
-RUN chown -R 1000:1000 \
+RUN chown -R appuser:appgroup \
     /run/mysqld \
     /run/apache2 \
     /run/php-fpm \
@@ -185,6 +186,12 @@ RUN chown -R 1000:1000 \
     /data && \
     chmod 1777 /tmp && \
     chmod -R u+rwX,go+rX /data /var/www/localhost /usr/share/webapps
+
+USER appuser
+RUN cd /usr/share/webapps/filemanager && \
+    composer require phpseclib/phpseclib && \
+    composer clear-cache
+USER root
 
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
@@ -207,8 +214,6 @@ rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run
 
 mkdir -p /data/htdocs /run/php-fpm
 
-chown -R 1000:1000 /data /var/www/localhost /tmp /usr/share/webapps /run/php-fpm 2>/dev/null || true
-
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
     rm -rf /var/www/localhost/htdocs 2>/dev/null || true
@@ -228,11 +233,14 @@ APACHECONF
 
 if [ ! -d /data/mysql/mysql ]; then
     find /data/mysql -mindepth 1 -delete 2>/dev/null || true
-    mariadb-install-db --datadir=/data/mysql --skip-test-db --user=1000 --auth-root-authentication-method=normal
+    mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
 fi
+
+ROOT_PASS=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24)
 
 cat << SQL > /tmp/init.sql
 FLUSH PRIVILEGES;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PASS}';
 CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
@@ -244,7 +252,7 @@ mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/ru
 MYSQL_PID="$!"
 
 TRIES=0
-until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root --silent 2>/dev/null; do
+until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --silent 2>/dev/null; do
     TRIES=$((TRIES+1))
     if [ "$TRIES" -ge 30 ]; then
         cat /data/mysql/*.err 2>/dev/null || true
@@ -255,17 +263,17 @@ done
 
 rm -f /tmp/init.sql
 
-mariadb --socket=/run/mysqld/mysqld.sock -u root << SQL
+mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" << SQL
 CREATE DATABASE IF NOT EXISTS phpmyadmin;
 SQL
 
 CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
 
 if [ -n "$CREATE_TABLES_SQL" ]; then
-    mariadb --socket=/run/mysqld/mysqld.sock -u root phpmyadmin -e "SHOW TABLES LIKE 'pma__bookmark';" | grep -q pma__bookmark || mariadb --socket=/run/mysqld/mysqld.sock -u root < "$CREATE_TABLES_SQL" || true
+    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" phpmyadmin -e "SHOW TABLES LIKE 'pma__bookmark';" | grep -q pma__bookmark || mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" < "$CREATE_TABLES_SQL" || true
 fi
 
-mariadb --socket=/run/mysqld/mysqld.sock -u root << SQL
+mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" << SQL
 GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO '${MYSQL_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
@@ -311,9 +319,9 @@ done
 EOF
 
 RUN chmod +x /start.sh && \
-    chown 1000:1000 /start.sh
+    chown appuser:appgroup /start.sh
 
 WORKDIR /var/www/localhost/htdocs
-USER 1000
+USER appuser
 EXPOSE 7860
 CMD ["tini", "--", "/start.sh"]
