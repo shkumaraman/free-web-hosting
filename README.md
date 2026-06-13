@@ -56,7 +56,7 @@
 | 💻 **Web Terminal** | Browser-based shell support through the bundled File Manager |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
 | 💾 **Persistent Storage** | `/data` mount recommended/required for preserving database and site files |
-| 🔒 **Non-root** | Runs as user `1000` for improved container security |
+| 🔒 **Non-root** | Runs as non-root appuser (UID 1000) for improved container security |
 | 🐳 **Alpine Base** | Lightweight Linux base image |
 | 🎬 **FFmpeg** | Audio/video processing toolkit for media workflows |
 | ☁️ **HF Spaces Ready** | Designed for Hugging Face Docker Spaces |
@@ -382,7 +382,7 @@ Set:
 ### What the Container Does Automatically
 On first boot:
 ```bash
-mariadb-install-db --datadir=/data/mysql --skip-test-db --user=1000
+mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser
 
 ```
 Every boot:
@@ -392,7 +392,9 @@ mariadbd --datadir=/data/mysql --bind-address=127.0.0.1
 ```
 You do not need to run these manually. The startup script handles it.
 ## ⚙️ Environment Variables & .env
-You can configure your PHP app using a .env file.
+> 💡 **Note:** If deploying on Hugging Face Spaces, use the **Space Settings UI** for variables instead of creating a .env file.
+> 
+You can configure your PHP app using a .env file for VPS/Local deployments.
 Place it here:
 ```txt
 /var/www/localhost/htdocs/.env
@@ -558,7 +560,7 @@ export default {
       const url = new URL(request.url);
 
       // Replace with your actual Hugging Face Space host.
-      // Example: "username-space-name.hf.space"
+      // Example: "my-awesome-app.hf.space"
       const backendHost = "YOUR_USERNAME-YOUR_SPACE_NAME.hf.space";
 
       const backendUrl = new URL(request.url);
@@ -665,7 +667,7 @@ Do not include a trailing slash
 ```
 Example:
 ```js
-const backendHost = "shkumaraman-backend.hf.space";
+const backendHost = "my-awesome-app.hf.space";
 
 ```
 ### Step 4 — Attach Your Domain to the Worker
@@ -780,6 +782,7 @@ git push origin feature/amazing-feature
 ```
  5. Open a Pull Request
 <div align="center">
-**Made with ❤️ for developers who love simplicity**
-⭐ **If this helped you, please give it a Star!** ⭐
+<b>Made with ❤️ for developers who love simplicity</b>
+
+⭐ <b>If this helped you, please give it a Star!</b> ⭐
 </div>
