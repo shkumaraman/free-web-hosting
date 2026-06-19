@@ -37,16 +37,16 @@ RUN sed -i 's/^User apache/User appuser/' /etc/apache2/httpd.conf && \
     printf "\nServerName localhost\n\
 Timeout 60\n\
 KeepAlive On\n\
-MaxKeepAliveRequests 300\n\
+MaxKeepAliveRequests 100\n\
 KeepAliveTimeout 2\n\
-ProxyTimeout 600\n\
+ProxyTimeout 300\n\
 <IfModule mpm_event_module>\n\
-    StartServers 4\n\
-    MinSpareThreads 75\n\
-    MaxSpareThreads 250\n\
+    StartServers 1\n\
+    MinSpareThreads 25\n\
+    MaxSpareThreads 75\n\
     ThreadsPerChild 25\n\
-    MaxRequestWorkers 500\n\
-    MaxConnectionsPerChild 10000\n\
+    MaxRequestWorkers 100\n\
+    MaxConnectionsPerChild 1000\n\
 </IfModule>\n\
 <FilesMatch \\.php$>\n\
     SetHandler \"proxy:fcgi://127.0.0.1:9000/\"\n\
@@ -79,28 +79,27 @@ RUN find /etc/php* -name php-fpm.conf -exec sh -c '\
     sed -i "s|^listen = .*|listen = 127.0.0.1:9000|" "$1" && \
     sed -i "s|^;*listen.allowed_clients = .*|listen.allowed_clients = 127.0.0.1|" "$1" && \
     sed -i "s|^pm = .*|pm = dynamic|" "$1" && \
-    sed -i "s|^pm.max_children = .*|pm.max_children = 100|" "$1" && \
-    sed -i "s|^pm.start_servers = .*|pm.start_servers = 20|" "$1" && \
-    sed -i "s|^pm.min_spare_servers = .*|pm.min_spare_servers = 10|" "$1" && \
-    sed -i "s|^pm.max_spare_servers = .*|pm.max_spare_servers = 40|" "$1" && \
-    sed -i "s|^;*pm.max_requests = .*|pm.max_requests = 1000|" "$1" && \
-    sed -i "s|^;*request_terminate_timeout = .*|request_terminate_timeout = 600s|" "$1" && \
+    sed -i "s|^pm.max_children = .*|pm.max_children = 10|" "$1" && \
+    sed -i "s|^pm.start_servers = .*|pm.start_servers = 2|" "$1" && \
+    sed -i "s|^pm.min_spare_servers = .*|pm.min_spare_servers = 1|" "$1" && \
+    sed -i "s|^pm.max_spare_servers = .*|pm.max_spare_servers = 4|" "$1" && \
+    sed -i "s|^;*pm.max_requests = .*|pm.max_requests = 300|" "$1" && \
+    sed -i "s|^;*request_terminate_timeout = .*|request_terminate_timeout = 300s|" "$1" && \
     sed -i "s|^;*clear_env = .*|clear_env = no|" "$1" && \
     sed -i "s|^;*catch_workers_output = .*|catch_workers_output = yes|" "$1" && \
     sed -i "s|^;*decorate_workers_output = .*|decorate_workers_output = no|" "$1"' sh {} \;
 
-RUN cat << 'EOF' > /etc/my.cnf.d/16gb.cnf
+RUN cat << 'EOF' > /etc/my.cnf.d/hf.cnf
 [mariadb]
-max_connections=300
-thread_cache_size=100
-table_open_cache=4096
-tmp_table_size=256M
-max_heap_table_size=256M
-max_allowed_packet=512M
-innodb_buffer_pool_size=5G
-innodb_log_file_size=512M
+max_connections=50
+thread_cache_size=16
+table_open_cache=512
+tmp_table_size=32M
+max_heap_table_size=32M
+max_allowed_packet=64M
+innodb_buffer_pool_size=128M
+innodb_log_file_size=64M
 innodb_flush_log_at_trx_commit=2
-innodb_file_per_table=1
 skip-name-resolve
 EOF
 
@@ -138,23 +137,22 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "session.cookie_secure = On" >> "{}" && \
     echo "session.cookie_samesite = \"None\"" >> "{}" && \
     echo "opcache.enable=1" >> "{}" && \
-    echo "opcache.memory_consumption=256" >> "{}" && \
-    echo "opcache.interned_strings_buffer=32" >> "{}" && \
-    echo "opcache.max_accelerated_files=100000" >> "{}" && \
+    echo "opcache.memory_consumption=128" >> "{}" && \
+    echo "opcache.interned_strings_buffer=16" >> "{}" && \
+    echo "opcache.max_accelerated_files=20000" >> "{}" && \
     echo "opcache.validate_timestamps=1" >> "{}" && \
     echo "opcache.revalidate_freq=2" >> "{}" && \
-    echo "opcache.fast_shutdown=1" >> "{}" && \
-    echo "realpath_cache_size=4096K" >> "{}" && \
-    echo "realpath_cache_ttl=600" >> "{}" && \
+    echo "realpath_cache_size=1024K" >> "{}" && \
+    echo "realpath_cache_ttl=300" >> "{}" && \
     echo "session.save_path=\"/tmp\"" >> "{}" && \
     echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
-    echo "upload_max_filesize=5G" >> "{}" && \
-    echo "post_max_size=5G" >> "{}" && \
-    echo "memory_limit=2G" >> "{}" && \
-    echo "max_execution_time=600" >> "{}" && \
-    echo "max_input_time=600" >> "{}" && \
-    echo "max_file_uploads=200" >> "{}" && \
+    echo "upload_max_filesize=512M" >> "{}" && \
+    echo "post_max_size=512M" >> "{}" && \
+    echo "memory_limit=512M" >> "{}" && \
+    echo "max_execution_time=300" >> "{}" && \
+    echo "max_input_time=300" >> "{}" && \
+    echo "max_file_uploads=100" >> "{}" && \
     echo "log_errors=On" >> "{}" && \
     echo "error_log=/tmp/php-error.log" >> "{}"' \;
 
@@ -188,9 +186,11 @@ RUN chown -R appuser:appgroup \
     chmod -R u+rwX,go+rX /data /var/www/localhost /usr/share/webapps
 
 USER appuser
+
 RUN cd /usr/share/webapps/filemanager && \
     composer require phpseclib/phpseclib && \
     composer clear-cache
+
 USER root
 
 RUN cat << 'EOF' > /start.sh
@@ -201,18 +201,19 @@ FPM_PID=""
 HTTPD_PID=""
 
 stop_all() {
+    CODE="${1:-0}"
     [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
     [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
     [ -n "$MYSQL_PID" ] && kill "$MYSQL_PID" 2>/dev/null || true
     wait 2>/dev/null || true
-    exit 0
+    exit "$CODE"
 }
 
-trap stop_all INT TERM
+trap 'stop_all 0' INT TERM
 
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid /data/mysql/tc.log 2>/dev/null || true
 
-mkdir -p /data/htdocs /run/php-fpm
+mkdir -p /data/htdocs /run/php-fpm /run/mysqld /run/apache2
 
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
@@ -230,6 +231,30 @@ cat > /etc/apache2/conf.d/tool-aliases.conf << APACHECONF
 Alias /${SQL_PATH:-sql} /usr/share/webapps/phpmyadmin
 Alias /${FILES_PATH:-files} /usr/share/webapps/filemanager
 APACHECONF
+
+PHP_FPM_BIN="$(command -v php-fpm || find /usr/sbin /usr/bin -maxdepth 1 -type f -name 'php-fpm*' 2>/dev/null | sort | head -n 1)"
+
+if [ -z "$PHP_FPM_BIN" ]; then
+    stop_all 1
+fi
+
+"$PHP_FPM_BIN" -F &
+FPM_PID="$!"
+
+sleep 2
+
+if ! kill -0 "$FPM_PID" 2>/dev/null; then
+    stop_all 1
+fi
+
+httpd -D FOREGROUND &
+HTTPD_PID="$!"
+
+sleep 2
+
+if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
+    stop_all 1
+fi
 
 if [ ! -d /data/mysql/mysql ]; then
     find /data/mysql -mindepth 1 -delete 2>/dev/null || true
@@ -254,9 +279,9 @@ MYSQL_PID="$!"
 TRIES=0
 until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --silent 2>/dev/null; do
     TRIES=$((TRIES+1))
-    if [ "$TRIES" -ge 30 ]; then
+    if [ "$TRIES" -ge 60 ]; then
         cat /data/mysql/*.err 2>/dev/null || true
-        stop_all
+        stop_all 1
     fi
     sleep 2
 done
@@ -280,38 +305,20 @@ SQL
 
 chmod -R u+rwX,go+rX /data/htdocs 2>/dev/null || true
 
-PHP_FPM_BIN="$(command -v php-fpm || find /usr/sbin /usr/bin -maxdepth 1 -type f -name 'php-fpm*' 2>/dev/null | sort | head -n 1)"
-
-if [ -z "$PHP_FPM_BIN" ]; then
-    stop_all
-fi
-
-"$PHP_FPM_BIN" -F &
-FPM_PID="$!"
-
-sleep 2
-
-if ! kill -0 "$FPM_PID" 2>/dev/null; then
-    stop_all
-fi
-
-httpd -D FOREGROUND &
-HTTPD_PID="$!"
-
 while true; do
-    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
-        wait "$MYSQL_PID" 2>/dev/null || true
-        stop_all
+    if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
+        wait "$HTTPD_PID" 2>/dev/null || true
+        stop_all 1
     fi
 
     if ! kill -0 "$FPM_PID" 2>/dev/null; then
         wait "$FPM_PID" 2>/dev/null || true
-        stop_all
+        stop_all 1
     fi
 
-    if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
-        wait "$HTTPD_PID" 2>/dev/null || true
-        stop_all
+    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
+        wait "$MYSQL_PID" 2>/dev/null || true
+        stop_all 1
     fi
 
     sleep 2
@@ -322,6 +329,13 @@ RUN chmod +x /start.sh && \
     chown appuser:appgroup /start.sh
 
 WORKDIR /var/www/localhost/htdocs
+
 USER appuser
+
 EXPOSE 7860
+
+LABEL huggingface.co/port="7860"
+
+HEALTHCHECK CMD curl -fsS http://127.0.0.1:7860/ || exit 1
+
 CMD ["tini", "--", "/start.sh"]
