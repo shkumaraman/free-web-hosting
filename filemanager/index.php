@@ -3,29 +3,40 @@ session_start();
 $base_dir = realpath('/var/www/localhost/htdocs');
 require_once __DIR__ . '/vendor/autoload.php';
 
+// FIX 2: Bulletproof Symlink Path Traversal Protection using strict canonical physical paths
 function get_absolute_path($path) {
     global $base_dir;
-    $base = rtrim(str_replace('\\', '/', realpath($base_dir)), '/');
+    $realBase = realpath($base_dir);
     $path = str_replace('\\', '/', $path);
-    $parts = explode('/', $path);
+    $parts = array_filter(explode('/', $path), 'strlen');
     $safe = [];
     foreach ($parts as $p) {
         if ($p === '..') {
             array_pop($safe);
-        } elseif ($p !== '.' && $p !== '') {
+        } elseif ($p !== '.') {
             $safe[] = $p;
         }
     }
-    $finalPath = rtrim($base . '/' . implode('/', $safe), '/');
-    if (strpos($finalPath, $base) !== 0) {
-        return $base;
+    $finalPath = $realBase . '/' . implode('/', $safe);
+    $realFinalPath = realpath($finalPath);
+    
+    if ($realFinalPath === false) {
+        $parentDir = realpath(dirname($finalPath));
+        if ($parentDir === false || strpos($parentDir, $realBase) !== 0) {
+            return $realBase;
+        }
+        return rtrim($finalPath, '/');
     }
-    return $finalPath ?: $base;
+    
+    if (strpos($realFinalPath, $realBase) !== 0) {
+        return $realBase;
+    }
+    return rtrim($realFinalPath, '/');
 }
 
 function get_relative_path($path) {
     global $base_dir;
-    return ltrim(substr($path, strlen($base_dir)), '/');
+    return ltrim(substr($path, strlen(realpath($base_dir))), '/');
 }
 
 function format_size($bytes) {
@@ -105,6 +116,7 @@ if (isset($_GET['api'])) {
     $is_sftp = !empty($_SESSION['sftp_active']);
     
     $req = json_decode(file_get_contents('php://input'), true) ?: [];
+    $current_path = get_absolute_path($dir);
 
     if ($action === 'terminal') {
         $cwd = $_SESSION['term_cwd'] ?? $base_dir;
@@ -149,6 +161,75 @@ if (isset($_GET['api'])) {
         exit;
     }
 
+    // FIX 1: Chunked Upload Backend Handler (Unified for both Local & SFTP modes)
+    if ($action === 'upload_chunk') {
+        $fileName = basename($_POST['fileName'] ?? '');
+        $chunkIndex = intval($_POST['chunkIndex'] ?? 0);
+        $totalChunks = intval($_POST['totalChunks'] ?? 1);
+        
+        if (!$fileName || !isset($_FILES['file'])) {
+            echo json_encode(['status' => 'error', 'message' => 'Invalid chunk metadata']);
+            exit;
+        }
+        
+        $tempUploadDir = sys_get_temp_dir() . '/fm_chunks';
+        if (!is_dir($tempUploadDir)) mkdir($tempUploadDir, 0755, true);
+        
+        $tempFile = $tempUploadDir . '/' . md5($fileName . session_id()) . '.part';
+        $out = fopen($tempFile, $chunkIndex === 0 ? 'wb' : 'ab');
+        $in = fopen($_FILES['file']['tmp_name'], 'rb');
+        
+        if ($out && $in) {
+            while ($buff = fread($in, 4096)) {
+                fwrite($out, $buff);
+            }
+            fclose($in); fclose($out);
+        }
+        
+        if ($chunkIndex === $totalChunks - 1) {
+            if ($is_sftp) {
+                $sftp = sftp_connect();
+                $remote_cwd = $_SESSION['sftp_cwd'] ?? '/';
+                $dst = $remote_cwd . '/' . ltrim($dir, '/') . '/' . $fileName;
+                $sftp->put($dst, $tempFile, phpseclib3\Net\SFTP::SOURCE_LOCAL_FILE);
+                unlink($tempFile);
+            } else {
+                $targetFile = $current_path . '/' . $fileName;
+                rename($tempFile, $targetFile);
+            }
+            echo json_encode(['status' => 'success', 'completed' => true]);
+        } else {
+            echo json_encode(['status' => 'success', 'completed' => false]);
+        }
+        exit;
+    }
+
+    // FIX 4: Cross Transfer Handlers (SFTP <-> Local Bridge)
+    if ($action === 'transfer_to_local') {
+        $sftp = sftp_connect();
+        $localDir = get_absolute_path($req['localDir'] ?? '');
+        foreach ((array)($req['paths'] ?? []) as $p) {
+            $dst = $localDir . '/' . basename($p);
+            $sftp->get($p, $dst);
+        }
+        echo json_encode(['status' => 'success']);
+        exit;
+    }
+
+    if ($action === 'transfer_to_sftp') {
+        $sftp = sftp_connect();
+        $remoteDir = $_SESSION['sftp_cwd'] . '/' . ltrim($req['remoteDir'] ?? '', '/');
+        foreach ((array)($req['paths'] ?? []) as $p) {
+            $src = get_absolute_path($p);
+            $dst = rtrim($remoteDir, '/') . '/' . basename($src);
+            if (is_file($src)) {
+                $sftp->put($dst, $src, phpseclib3\Net\SFTP::SOURCE_LOCAL_FILE);
+            }
+        }
+        echo json_encode(['status' => 'success']);
+        exit;
+    }
+
     if ($is_sftp) {
         $sftp = sftp_connect();
         if (!$sftp) {
@@ -183,6 +264,7 @@ if (isset($_GET['api'])) {
                 echo json_encode(['status' => 'success', 'path' => $remote_cwd, 'items' => $items]);
                 exit;
             }
+            // FIX 3: Memory Exhaustion Safe SFTP Download/Preview
             if ($action === 'download' || $action === 'preview') {
                 $file = $req['path'] ?? $target_path;
                 if ($sftp->is_file($file)) {
@@ -190,7 +272,12 @@ if (isset($_GET['api'])) {
                     header('Content-Type: ' . $mime);
                     if ($action === 'download') header('Content-Disposition: attachment; filename="' . basename($file) . '"');
                     header('Content-Length: ' . $sftp->size($file));
-                    echo $sftp->get($file);
+                    
+                    $tmpFile = tempnam(sys_get_temp_dir(), 'sftp_stream');
+                    if ($sftp->get($file, $tmpFile)) {
+                        readfile($tmpFile);
+                        unlink($tmpFile);
+                    }
                 }
                 exit;
             }
@@ -211,8 +298,12 @@ if (isset($_GET['api'])) {
                     $dst = $remote_cwd . '/' . basename($req['dst']) . '/' . basename($p);
                     if ($action === 'move') $sftp->rename($src, $dst);
                     else {
-                        $content = $sftp->get($src);
-                        $sftp->put($dst, $content);
+                        // FIX 3: Stream-based clean remote copying via chunked localized staging
+                        $tmpCp = tempnam(sys_get_temp_dir(), 'sftp_cp');
+                        if ($sftp->get($src, $tmpCp)) {
+                            $sftp->put($dst, $tmpCp, phpseclib3\Net\SFTP::SOURCE_LOCAL_FILE);
+                            unlink($tmpCp);
+                        }
                     }
                 }
             } elseif ($action === 'read') {
@@ -233,7 +324,6 @@ if (isset($_GET['api'])) {
         exit;
     }
 
-    $current_path = get_absolute_path($dir);
     try {
         if ($action === 'list') {
             $items = [];
@@ -260,24 +350,6 @@ if (isset($_GET['api'])) {
                 return $a['is_dir'] ? -1 : 1;
             });
             echo json_encode(['status' => 'success', 'path' => get_relative_path($current_path), 'items' => $items]);
-            exit;
-        }
-        if ($action === 'upload' && !empty($_FILES['files'])) {
-            $uploaded = [];
-            $failed = [];
-            foreach ($_FILES['files']['name'] as $key => $name) {
-                if ($_FILES['files']['error'][$key] === UPLOAD_ERR_OK) {
-                    $dest = $current_path . '/' . basename($name);
-                    if (move_uploaded_file($_FILES['files']['tmp_name'][$key], $dest)) {
-                        $uploaded[] = $name;
-                    } else {
-                        $failed[] = $name;
-                    }
-                } else {
-                    $failed[] = $name;
-                }
-            }
-            echo json_encode(['status' => 'success', 'uploaded' => $uploaded, 'failed' => $failed]);
             exit;
         }
 
@@ -468,7 +540,7 @@ input,textarea{font-family:inherit}
 .file-row .fr-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-row .fr-size,.file-row .fr-perms,.file-row .fr-mtime,.file-row .fr-type{font-size:11px;color:var(--text2)}
 .list-header{display:grid;grid-template-columns:20px 24px 1fr 90px 90px 100px 80px;align-items:center;gap:8px;padding:5px 10px;font-size:11px;font-weight:600;color:var(--text2);letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--border);margin-bottom:4px;cursor:default}
-.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
+.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml覆{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
 #statusbar{height:var(--status-h);background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:11px;color:var(--text2);gap:16px}
 .sb-info{display:flex;align-items:center;gap:12px}
 .sb-badge{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 7px;font-size:11px}
@@ -610,6 +682,12 @@ input,textarea{font-family:inherit}
     <div class="sidebar-section">View</div>
     <div class="nav-item active" id="nav-grid" onclick="setView('grid')"><i class="fa-solid fa-grip"></i> Grid View</div>
     <div class="nav-item" id="nav-list" onclick="setView('list')"><i class="fa-solid fa-list"></i> List View</div>
+    
+    <div class="sidebar-section">Project Source</div>
+    <a href="https://github.com/shkumaraman/free-web-hosting" target="_blank" class="nav-item" style="text-decoration:none; color:var(--purple); font-weight:600;">
+      <i class="fa-brands fa-github" style="color:var(--purple);"></i> free-web-hosting
+    </a>
+
     <div style="flex:1"></div>
     <div class="disk-card" id="disk-card">
       <div class="disk-label"><span><i class="fa-solid fa-hard-drive"></i> Disk Usage</span><span id="disk-pct">–</span></div>
@@ -789,6 +867,7 @@ input,textarea{font-family:inherit}
 
 <script>
 let currentPath = '', currentItems = [], currentView = 'grid', multiSelect = false, selected = new Set(), sortField = 'name', sortAsc = true, remoteMode = false, remoteCwd = '/', editingPath = '', pendingFiles = [], renameTarget = '', currentPreviewPath = '';
+let sftpActive = <?php echo !empty($_SESSION['sftp_active']) ? 'true' : 'false'; ?>;
 
 function api(action, data={}) {
   const url = `?api=${action}&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`;
@@ -1100,6 +1179,12 @@ function showCtx(e, item, path) {
     ${!item.is_dir ? `<div class="ctx-item" onclick="openEditor('${escJs(path)}','${escJs(item.name)}')"><i class="fa-solid fa-pen"></i> Edit</div>` : ''}
     ${!item.is_dir ? `<div class="ctx-item" onclick="openPreview(currentItemByPath('${escJs(path)}'),'${escJs(path)}')"><i class="fa-solid fa-eye"></i> Preview</div>` : ''}
     ${!item.is_dir ? `<div class="ctx-item" onclick="downloadFile('${escJs(path)}')"><i class="fa-solid fa-download"></i> Download</div>` : ''}
+    
+    ${remoteMode ? 
+      `<div class="ctx-item" onclick="transferCross('to_local', '${escJs(path)}')"><i class="fa-solid fa-arrow-down-left-and-arrow-up-right-to-center"></i> Transfer to Local</div>` : 
+      (sftpActive ? `<div class="ctx-item" onclick="transferCross('to_sftp', '${escJs(path)}')"><i class="fa-solid fa-network-wired"></i> Transfer to SFTP</div>` : '')
+    }
+
     <div class="ctx-item" onclick="openRename('${escJs(path)}','${escJs(item.name)}')"><i class="fa-solid fa-pen-to-square"></i> Rename</div>
     <div class="ctx-item" onclick="openMoveCopyModal('copy')"><i class="fa-solid fa-copy"></i> Copy to…</div>
     <div class="ctx-item" onclick="openMoveCopyModal('move')"><i class="fa-solid fa-scissors"></i> Move to…</div>
@@ -1335,67 +1420,85 @@ function clearUploadQueue() {
   renderUploadList();
 }
 
-function doUpload() {
+// FIX 1: Frontend JS Chunked Upload Processing Logic Routine (2MB Chunks Sequential Streaming)
+async function processChunkedUpload(file) {
+  const chunkSize = 2 * 1024 * 1024; // 2MB Blocks
+  const totalChunks = Math.ceil(file.size / chunkSize);
+  const list = document.getElementById('upload-list');
+  
+  let row = document.createElement('div');
+  row.className = 'upload-item';
+  row.innerHTML = `<i class="fa-solid fa-file"></i><span class="ui-name">${escHtml(file.name)}</span><span class="ui-size">${fmtSize(file.size)}</span><span class="ui-status">Initialising...</span>`;
+  list.appendChild(row);
+  const statusEl = row.querySelector('.ui-status');
+
+  for (let index = 0; index < totalChunks; index++) {
+    const start = index * chunkSize;
+    const end = Math.min(start + chunkSize, file.size);
+    const chunk = file.slice(start, end);
+    
+    const fd = new FormData();
+    fd.append('file', chunk);
+    fd.append('fileName', file.name);
+    fd.append('chunkIndex', index);
+    fd.append('totalChunks', totalChunks);
+    
+    const url = `?api=upload_chunk&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`;
+    
+    try {
+      let res = await fetch(url, { method: 'POST', body: fd }).then(r => r.json());
+      if (res.status !== 'success') throw new Error(res.message || 'Chunk pipeline error');
+      
+      const pct = Math.round(((index + 1) / totalChunks) * 100);
+      statusEl.textContent = `Uploading ${pct}%`;
+    } catch (err) {
+      row.classList.add('failed');
+      statusEl.textContent = 'Upload Failed';
+      return false;
+    }
+  }
+  row.classList.add('done');
+  statusEl.textContent = 'Uploaded';
+  return true;
+}
+
+async function doUpload() {
   if (!pendingFiles.length) return;
   const btn = document.getElementById('upload-btn');
-  const list = document.getElementById('upload-list');
   btn.dataset.busy = '1';
   btn.disabled = true;
   btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading';
+  
+  document.getElementById('upload-list').innerHTML = '';
+  
+  for (let i = 0; i < pendingFiles.length; i++) {
+    await processChunkedUpload(pendingFiles[i]);
+  }
+  
+  btn.dataset.busy = '0';
+  btn.innerHTML = 'Upload';
+  pendingFiles = [];
+  document.getElementById('file-input').value = '';
+  await load(remoteMode ? remoteCwd : currentPath);
+  setTimeout(() => closeModal('upload-modal'), 1200);
+}
 
-  const fd = new FormData();
-  pendingFiles.forEach(f => fd.append('files[]', f));
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', `?api=upload&dir=${encodeURIComponent(remoteMode ? remoteCwd : currentPath)}`, true);
-
-  xhr.upload.onprogress = function(e) {
-    if (e.lengthComputable) {
-      const pct = Math.round((e.loaded / e.total) * 100);
-      list.querySelectorAll('.ui-status').forEach(el => el.textContent = `Uploading ${pct}%`);
-    }
-  };
-
-  xhr.onload = async function() {
-    btn.dataset.busy = '0';
-    btn.innerHTML = 'Upload';
-    btn.disabled = pendingFiles.length === 0;
-
-    if (xhr.status === 200) {
-      try {
-        const res = JSON.parse(xhr.responseText);
-        if (res.status === 'success') {
-          const uploaded = new Set(res.uploaded || []);
-          list.querySelectorAll('.upload-item').forEach((row, index) => {
-            const file = pendingFiles[index];
-            const ok = file && uploaded.has(file.name);
-            row.classList.toggle('done', ok);
-            row.classList.toggle('failed', !ok);
-            const status = row.querySelector('.ui-status');
-            if (status) status.textContent = ok ? 'Uploaded' : 'Skipped/Failed';
-          });
-          pendingFiles = [];
-          document.getElementById('file-input').value = '';
-          await load(remoteMode ? remoteCwd : currentPath);
-          setTimeout(() => closeModal('upload-modal'), 1200);
-        } else {
-          showToast(res.message || 'Upload failed', 'error');
-        }
-      } catch(err) {
-        showToast('Invalid response', 'error');
-      }
-    } else {
-      showToast('Upload failed', 'error');
-    }
-  };
-
-  xhr.onerror = function() {
-    btn.dataset.busy = '0';
-    btn.innerHTML = 'Upload';
-    showToast('Network error', 'error');
-  };
-
-  xhr.send(fd);
+// FIX 4: Cross Transfer UI API Core Controller
+async function transferCross(direction, path) {
+  const paths = selected.has(path) ? [...selected] : [path];
+  const action = direction === 'to_local' ? 'transfer_to_local' : 'transfer_to_sftp';
+  const data = direction === 'to_local' ? { paths, localDir: currentPath } : { paths, remoteDir: remoteCwd };
+  
+  showToast('Processing transfer across server boundaries...', 'info', 0);
+  const res = await api(action, data);
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  if (res.status === 'success') {
+    showToast('Cross transfer completed successfully', 'success');
+    selected.clear();
+    load();
+  } else {
+    showToast(res.message || 'Cross boundary pipeline crash', 'error');
+  }
 }
 
 function uploadDragOver(e) { e.preventDefault(); document.getElementById('upload-drop').classList.add('drag'); }
@@ -1512,6 +1615,7 @@ async function sftpConnect() {
   const res = await fetch('?api=sftp_connect&dir=', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host, port, user, pass }) }).then(r => r.json());
   if (res.status === 'success') {
     remoteMode = true;
+    sftpActive = true;
     remoteCwd = res.cwd || '/';
     closeModal('sftp-modal');
     document.getElementById('nav-remote').classList.add('active');
@@ -1525,6 +1629,7 @@ function loadLocalRoot() {
   if (remoteMode) {
     fetch('?api=sftp_disconnect&dir=').then(() => {
       remoteMode = false;
+      sftpActive = false;
       document.getElementById('nav-remote').classList.remove('active');
       document.getElementById('nav-local').classList.add('active');
       document.getElementById('sftp-label').textContent = 'Connect SFTP';
