@@ -261,7 +261,6 @@ if (isset($_GET['api'])) {
                 echo json_encode(['status' => 'success', 'path' => $remote_cwd, 'items' => $items]);
                 exit;
             }
-
             if ($action === 'download' || $action === 'preview') {
                 $file = $req['path'] ?? $target_path;
                 if ($sftp->is_file($file)) {
@@ -295,7 +294,7 @@ if (isset($_GET['api'])) {
                     $dst = $remote_cwd . '/' . basename($req['dst']) . '/' . basename($p);
                     if ($action === 'move') $sftp->rename($src, $dst);
                     else {
-                                                $tmpCp = tempnam(sys_get_temp_dir(), 'sftp_cp');
+                        $tmpCp = tempnam(sys_get_temp_dir(), 'sftp_cp');
                         if ($sftp->get($src, $tmpCp)) {
                             $sftp->put($dst, $tmpCp, phpseclib3\Net\SFTP::SOURCE_LOCAL_FILE);
                             unlink($tmpCp);
@@ -536,7 +535,7 @@ input,textarea{font-family:inherit}
 .file-row .fr-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-row .fr-size,.file-row .fr-perms,.file-row .fr-mtime,.file-row .fr-type{font-size:11px;color:var(--text2)}
 .list-header{display:grid;grid-template-columns:20px 24px 1fr 90px 90px 100px 80px;align-items:center;gap:8px;padding:5px 10px;font-size:11px;font-weight:600;color:var(--text2);letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--border);margin-bottom:4px;cursor:default}
-.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml覆{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
+.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js覆{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
 #statusbar{height:var(--status-h);background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:11px;color:var(--text2);gap:16px}
 .sb-info{display:flex;align-items:center;gap:12px}
 .sb-badge{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 7px;font-size:11px}
@@ -681,7 +680,7 @@ input,textarea{font-family:inherit}
     
     <div class="sidebar-section">Project Source</div>
     <a href="https://github.com/shkumaraman/free-web-hosting" target="_blank" class="nav-item" style="text-decoration:none; color:var(--purple); font-weight:600;">
-      <i class="fa-brands fa-github" style="color:var(--purple);"></i> free-web-hosting
+      <i class="fa-brands fa-github" style="color:var(--purple);"></i> SHKUMARAMAN
     </a>
 
     <div style="flex:1"></div>
@@ -1416,9 +1415,8 @@ function clearUploadQueue() {
   renderUploadList();
 }
 
-// FIX 1: Frontend JS Chunked Upload Processing Logic Routine (2MB Chunks Sequential Streaming)
 async function processChunkedUpload(file) {
-  const chunkSize = 2 * 1024 * 1024; // 2MB Blocks
+  const chunkSize = 2 * 1024 * 1024;
   const totalChunks = Math.ceil(file.size / chunkSize);
   const list = document.getElementById('upload-list');
   
@@ -1443,7 +1441,7 @@ async function processChunkedUpload(file) {
     
     try {
       let res = await fetch(url, { method: 'POST', body: fd }).then(r => r.json());
-      if (res.status !== 'success') throw new Error(res.message || 'Chunk pipeline error');
+      if (res.status !== 'success') throw new Error(res.message || 'Chunk error');
       
       const pct = Math.round(((index + 1) / totalChunks) * 100);
       statusEl.textContent = `Uploading ${pct}%`;
@@ -1479,7 +1477,6 @@ async function doUpload() {
   setTimeout(() => closeModal('upload-modal'), 1200);
 }
 
-// FIX 4: Cross Transfer UI API Core Controller
 async function transferCross(direction, path) {
   const paths = selected.has(path) ? [...selected] : [path];
   const action = direction === 'to_local' ? 'transfer_to_local' : 'transfer_to_sftp';
