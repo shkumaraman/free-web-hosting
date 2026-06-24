@@ -3,7 +3,6 @@ session_start();
 $base_dir = realpath('/var/www/localhost/htdocs');
 require_once __DIR__ . '/vendor/autoload.php';
 
-// FIX 2: Bulletproof Symlink Path Traversal Protection using strict canonical physical paths
 function get_absolute_path($path) {
     global $base_dir;
     $realBase = realpath($base_dir);
@@ -161,7 +160,6 @@ if (isset($_GET['api'])) {
         exit;
     }
 
-    // FIX 1: Chunked Upload Backend Handler (Unified for both Local & SFTP modes)
     if ($action === 'upload_chunk') {
         $fileName = basename($_POST['fileName'] ?? '');
         $chunkIndex = intval($_POST['chunkIndex'] ?? 0);
@@ -204,7 +202,6 @@ if (isset($_GET['api'])) {
         exit;
     }
 
-    // FIX 4: Cross Transfer Handlers (SFTP <-> Local Bridge)
     if ($action === 'transfer_to_local') {
         $sftp = sftp_connect();
         $localDir = get_absolute_path($req['localDir'] ?? '');
@@ -264,7 +261,7 @@ if (isset($_GET['api'])) {
                 echo json_encode(['status' => 'success', 'path' => $remote_cwd, 'items' => $items]);
                 exit;
             }
-            // FIX 3: Memory Exhaustion Safe SFTP Download/Preview
+
             if ($action === 'download' || $action === 'preview') {
                 $file = $req['path'] ?? $target_path;
                 if ($sftp->is_file($file)) {
@@ -298,8 +295,7 @@ if (isset($_GET['api'])) {
                     $dst = $remote_cwd . '/' . basename($req['dst']) . '/' . basename($p);
                     if ($action === 'move') $sftp->rename($src, $dst);
                     else {
-                        // FIX 3: Stream-based clean remote copying via chunked localized staging
-                        $tmpCp = tempnam(sys_get_temp_dir(), 'sftp_cp');
+                                                $tmpCp = tempnam(sys_get_temp_dir(), 'sftp_cp');
                         if ($sftp->get($src, $tmpCp)) {
                             $sftp->put($dst, $tmpCp, phpseclib3\Net\SFTP::SOURCE_LOCAL_FILE);
                             unlink($tmpCp);
