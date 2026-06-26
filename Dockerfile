@@ -65,6 +65,12 @@ ProxyTimeout 300
     AllowOverride All
     Require all granted
 </Directory>
+<Directory /data/htdocs>
+    Options Indexes FollowSymLinks
+    IndexOptions FancyIndexing FoldersFirst NameWidth=* DescriptionWidth=* VersionSort
+    AllowOverride All
+    Require all granted
+</Directory>
 DirectoryIndex index.php index.html
 EOF
 RUN find /etc/php* -name php-fpm.conf -exec sh -c '\
