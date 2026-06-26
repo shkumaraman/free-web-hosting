@@ -206,8 +206,8 @@ stop_all() {
 }
 trap 'stop_all 0' INT TERM
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid /data/mysql/tc.log 2>/dev/null || true
-mkdir -p /data/htdocs /data/sessions /run/php-fpm /run/mysqld /run/apache2
-chown -R appuser:appgroup /data/sessions 2>/dev/null || true
+mkdir -p /data/htdocs /data/sessions /run/php-fpm /run/mysqld /run/apache2 /data/mysql
+chown -R appuser:appgroup /data/sessions /data/mysql 2>/dev/null || true
 chmod 700 /data/sessions 2>/dev/null || true
 if [ ! -L /var/www/localhost/htdocs ]; then
     cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
@@ -240,6 +240,7 @@ if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
     stop_all 1
 fi
 if [ ! -d /data/mysql/mysql ]; then
+    mkdir -p /data/mysql
     find /data/mysql -mindepth 1 -delete 2>/dev/null || true
     mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
 fi
@@ -250,7 +251,7 @@ ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PASS}';
 CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${MYSQL_USER}'@'%';
+GRANT ALL PRIVILEGES ON *.* TO '${MYSQL_USER}'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid --skip-networking=OFF --innodb-use-native-aio=0 --init-file=/tmp/init.sql &
@@ -299,5 +300,4 @@ WORKDIR /var/www/localhost/htdocs
 USER appuser
 EXPOSE 7860
 LABEL huggingface.co/port="7860"
-HEALTHCHECK CMD curl -fsS http://127.0.0.1:7860/ || exit 1
 CMD ["tini", "--", "/start.sh"]
