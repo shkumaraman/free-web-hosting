@@ -19,7 +19,7 @@ RUN apk add --no-cache \
     php-pdo php-sodium php-ftp php-calendar \
     php-pcntl php-gettext php-shmop php-sysvmsg \
     php-sysvsem php-sysvshm php-tidy php-xsl php-bz2 php-gmp \
-    readline wget git composer nano tini ffmpeg libarchive-tools
+    readline wget git composer nano tini ffmpeg libarchive-tools redis
 
 RUN addgroup -g 1000 appgroup && \
     adduser -u 1000 -G appgroup -D -s /bin/sh appuser
@@ -33,10 +33,10 @@ RUN sed -i 's/^User apache/User appuser/' /etc/apache2/httpd.conf && \
     sed -i '/mod_proxy\.so/s/^#//' /etc/apache2/httpd.conf && \
     sed -i '/mod_proxy_fcgi\.so/s/^#//' /etc/apache2/httpd.conf && \
     sed -i '/mod_rewrite\.so/s/^#//' /etc/apache2/httpd.conf && \
+    sed -i '/mod_autoindex\.so/s/^#//' /etc/apache2/httpd.conf && \
     sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/httpd.conf
 
 RUN cat << 'EOF' >> /etc/apache2/httpd.conf
-
 ServerName localhost
 Timeout 60
 KeepAlive On
@@ -66,13 +66,13 @@ ProxyTimeout 300
 </Directory>
 <Directory /var/www/localhost/htdocs>
     Options Indexes FollowSymLinks
-    IndexOptions FancyIndexing FoldersFirst NameWidth=* DescriptionWidth=* VersionSort
+    IndexOptions FancyIndexing HTMLTable FoldersFirst IconsAreLinks NameWidth=* DescriptionWidth=* VersionSort Charset=UTF-8
     AllowOverride All
     Require all granted
 </Directory>
 <Directory /data/htdocs>
     Options Indexes FollowSymLinks
-    IndexOptions FancyIndexing FoldersFirst NameWidth=* DescriptionWidth=* VersionSort
+    IndexOptions FancyIndexing HTMLTable FoldersFirst IconsAreLinks NameWidth=* DescriptionWidth=* VersionSort Charset=UTF-8
     AllowOverride All
     Require all granted
 </Directory>
@@ -145,8 +145,8 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "realpath_cache_size=1024K" >> "{}" && \
     echo "realpath_cache_ttl=300" >> "{}" && \
     echo "session.save_path=\"/data/sessions\"" >> "{}" && \
-    echo "sys_temp_dir=\"/data/tmp\"" >> "{}" && \
-    echo "upload_tmp_dir=\"/data/tmp\"" >> "{}" && \
+    echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
+    echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_max_filesize=512M" >> "{}" && \
     echo "post_max_size=512M" >> "{}" && \
     echo "memory_limit=512M" >> "{}" && \
@@ -163,9 +163,9 @@ RUN mkdir -p \
     /data/mysql \
     /data/htdocs \
     /data/sessions \
-    /data/tmp \
     /data/config \
     /data/webapps \
+    /data/backups \
     /var/www/localhost/htdocs \
     /usr/share/webapps/filemanager \
     /etc/apache2/conf.d \
@@ -186,9 +186,10 @@ RUN chown -R appuser:appgroup \
     /etc/apache2/conf.d \
     /usr/share/webapps \
     /etc/my.cnf.d \
+    /tmp \
     /data && \
     chmod 1777 /tmp && \
-    chmod 1777 /data/tmp && \
+    chmod 755 /run/mysqld && \
     chmod -R u+rwX,go+rX /data /var/www/localhost /usr/share/webapps
 
 USER appuser
@@ -202,23 +203,29 @@ RUN cat << 'EOF' > /start.sh
 MYSQL_PID=""
 FPM_PID=""
 HTTPD_PID=""
+REDIS_PID=""
+BACKUP_PID=""
 
 stop_all() {
     CODE="${1:-0}"
     [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
     [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
     [ -n "$MYSQL_PID" ] && kill "$MYSQL_PID" 2>/dev/null || true
+    [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null || true
+    [ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null || true
     wait 2>/dev/null || true
     exit "$CODE"
 }
 trap 'stop_all 0' INT TERM
 
-rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid /data/mysql/tc.log 2>/dev/null || true
+mkdir -p /run/mysqld /run/php-fpm /run/apache2
+chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp 2>/dev/null || true
+rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid 2>/dev/null || true
+rm -f /data/mysql/tc.log /data/mysql/aria_log_control 2>/dev/null || true
 
-mkdir -p /data/htdocs /data/sessions /data/mysql /data/tmp /data/config /data/webapps /run/php-fpm /run/mysqld /run/apache2
-chown -R appuser:appgroup /data/sessions /data/mysql /data/tmp /data/config /data/webapps 2>/dev/null || true
+mkdir -p /data/htdocs /data/sessions /data/mysql /data/config /data/webapps /data/backups
+chown -R appuser:appgroup /data/sessions /data/mysql /data/config /data/webapps /data/backups 2>/dev/null || true
 chmod 700 /data/sessions 2>/dev/null || true
-chmod 1777 /data/tmp 2>/dev/null || true
 
 for app in phpmyadmin filemanager; do
     if [ ! -d "/data/webapps/$app" ]; then
@@ -267,83 +274,149 @@ Alias /${SQL_PATH:-sql} /usr/share/webapps/phpmyadmin
 Alias /${FILES_PATH:-files} /usr/share/webapps/filemanager
 APACHECONF
 
-PHP_FPM_BIN="$(command -v php-fpm || find /usr/sbin /usr/bin -maxdepth 1 -type f -name 'php-fpm*' 2>/dev/null | sort | head -n 1)"
-if [ -z "$PHP_FPM_BIN" ]; then
-    stop_all 1
+if [ ! -f /data/config/root_pass.txt ]; then
+    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24 > /data/config/root_pass.txt
 fi
-"$PHP_FPM_BIN" -F &
-FPM_PID="$!"
-sleep 2
-if ! kill -0 "$FPM_PID" 2>/dev/null; then
-    stop_all 1
-fi
+ROOT_PASS=$(cat /data/config/root_pass.txt)
 
-httpd -D FOREGROUND &
-HTTPD_PID="$!"
-sleep 2
-if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
-    stop_all 1
-fi
+start_mariadb_process() {
+    mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 \
+        --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid \
+        --tmpdir=/tmp --innodb-use-native-aio=0 --skip-networking=OFF > /tmp/mariadb.log 2>&1 &
+    MYSQL_PID="$!"
+}
 
 if [ ! -d /data/mysql/mysql ]; then
-    mkdir -p /data/mysql
-    find /data/mysql -mindepth 1 -delete 2>/dev/null || true
     mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
 fi
 
-ROOT_PASS=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24)
-cat << SQL > /tmp/init.sql
-FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PASS}';
-CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
-CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
-GRANT ALL PRIVILEGES ON *.* TO '${MYSQL_USER}'@'%' WITH GRANT OPTION;
-FLUSH PRIVILEGES;
-SQL
+echo ">>> Starting MariaDB..."
+start_mariadb_process
 
-mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid --skip-networking=OFF --innodb-use-native-aio=0 --init-file=/tmp/init.sql &
-MYSQL_PID="$!"
 TRIES=0
-until mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --silent 2>/dev/null; do
+while true; do
+    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
+        echo ">>> ERROR: MariaDB crashed! DB might be corrupt."
+        cat /tmp/mariadb.log
+        echo ">>> AUTO-RECOVERY INITIATED: Moving corrupt DB files to backup and building a fresh one..."
+        BACKUP_DIR="/data/backups/mysql_corrupt_$(date +%s)"
+        mkdir -p "$BACKUP_DIR"
+        find /data/mysql -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR/" \; 2>/dev/null || true
+        mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
+        echo ">>> Starting MariaDB again after Auto-Recovery..."
+        start_mariadb_process
+        
+        REC_TRIES=0
+        while true; do
+            if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
+                echo ">>> FATAL: MariaDB crashed even after Auto-Recovery! Giving up."
+                cat /tmp/mariadb.log
+                stop_all 1
+            fi
+            if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
+                break 2
+            fi
+            REC_TRIES=$((REC_TRIES+1))
+            if [ "$REC_TRIES" -ge 60 ]; then
+                echo ">>> FATAL: MariaDB ping timeout after Auto-Recovery."
+                cat /tmp/mariadb.log
+                stop_all 1
+            fi
+            sleep 2
+        done
+    fi
+    
+    if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
+        break
+    fi
+    
     TRIES=$((TRIES+1))
     if [ "$TRIES" -ge 60 ]; then
-        cat /data/mysql/*.err 2>/dev/null || true
+        echo ">>> ERROR: MariaDB ping timeout!"
+        cat /tmp/mariadb.log
         stop_all 1
     fi
     sleep 2
 done
 
-rm -f /tmp/init.sql
-mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" << SQL
+echo ">>> MariaDB is ready. Configuring Databases & Users..."
+cat << SQL > /tmp/init.sql
+ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY '${ROOT_PASS}';
+CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE DATABASE IF NOT EXISTS phpmyadmin;
-SQL
-
-CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
-if [ -n "$CREATE_TABLES_SQL" ]; then
-    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" phpmyadmin -e "SHOW TABLES LIKE 'pma__bookmark';" | grep -q pma__bookmark || mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" < "$CREATE_TABLES_SQL" || true
-fi
-
-mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" << SQL
+CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
+ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
+GRANT ALL PRIVILEGES ON *.* TO '${MYSQL_USER}'@'%' WITH GRANT OPTION;
 GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO '${MYSQL_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
 
+mariadb --socket=/run/mysqld/mysqld.sock -u root < /tmp/init.sql 2>/dev/null || \
+mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" < /tmp/init.sql 2>/dev/null || \
+echo ">>> Note: SQL init ignored (Already Configured)"
+rm -f /tmp/init.sql
+
+echo ">>> Checking phpMyAdmin tables..."
+CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
+if [ -n "$CREATE_TABLES_SQL" ]; then
+    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" phpmyadmin -e "SHOW TABLES LIKE 'pma__bookmark';" 2>/dev/null | grep -q pma__bookmark || \
+    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" < "$CREATE_TABLES_SQL" 2>/dev/null || true
+fi
+
+echo ">>> Starting Redis..."
+redis-server --bind 127.0.0.1 --port 6379 --protected-mode yes --daemonize no --dir /tmp > /tmp/redis.log 2>&1 &
+REDIS_PID="$!"
+sleep 2
+if ! kill -0 "$REDIS_PID" 2>/dev/null; then
+    echo ">>> ERROR: Redis failed to start!"
+    cat /tmp/redis.log
+    stop_all 1
+fi
+
+echo ">>> Starting PHP-FPM..."
+PHP_FPM_BIN="$(command -v php-fpm || find /usr/sbin /usr/bin -maxdepth 1 -type f -name 'php-fpm*' 2>/dev/null | sort | head -n 1)"
+if [ -z "$PHP_FPM_BIN" ]; then
+    echo ">>> ERROR: PHP-FPM binary not found!"
+    stop_all 1
+fi
+"$PHP_FPM_BIN" -F > /tmp/php.log 2>&1 &
+FPM_PID="$!"
+sleep 2
+if ! kill -0 "$FPM_PID" 2>/dev/null; then
+    echo ">>> ERROR: PHP-FPM failed to start!"
+    cat /tmp/php.log
+    stop_all 1
+fi
+
+echo ">>> Starting Apache..."
+httpd -D FOREGROUND > /tmp/apache.log 2>&1 &
+HTTPD_PID="$!"
+sleep 2
+if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
+    echo ">>> ERROR: Apache failed to start!"
+    cat /tmp/apache.log
+    stop_all 1
+fi
+
+echo ">>> Server is fully ready! Starting backup loop..."
+(
+    while true; do
+        sleep 86400
+        TS=$(date +%Y%m%d_%H%M%S)
+        mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "/data/backups/db_${TS}.sql" 2>/dev/null || true
+        tar -czf "/data/backups/files_${TS}.tar.gz" -C /data/htdocs . 2>/dev/null || true
+        find /data/backups -type f -mtime +7 -delete 2>/dev/null || true
+    done
+) &
+BACKUP_PID="$!"
+
 chmod -R u+rwX,go+rX /data/htdocs 2>/dev/null || true
 
 while true; do
-    if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
-        wait "$HTTPD_PID" 2>/dev/null || true
-        stop_all 1
-    fi
-    if ! kill -0 "$FPM_PID" 2>/dev/null; then
-        wait "$FPM_PID" 2>/dev/null || true
-        stop_all 1
-    fi
-    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
-        wait "$MYSQL_PID" 2>/dev/null || true
-        stop_all 1
-    fi
+    if ! kill -0 "$HTTPD_PID" 2>/dev/null; then echo ">>> ALERT: Apache died!"; wait "$HTTPD_PID" 2>/dev/null || true; stop_all 1; fi
+    if ! kill -0 "$FPM_PID" 2>/dev/null; then echo ">>> ALERT: PHP-FPM died!"; wait "$FPM_PID" 2>/dev/null || true; stop_all 1; fi
+    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then echo ">>> ALERT: MariaDB died!"; wait "$MYSQL_PID" 2>/dev/null || true; stop_all 1; fi
+    if ! kill -0 "$REDIS_PID" 2>/dev/null; then echo ">>> ALERT: Redis died!"; wait "$REDIS_PID" 2>/dev/null || true; stop_all 1; fi
     sleep 2
 done
 EOF
