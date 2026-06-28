@@ -18,7 +18,7 @@
 
 ### ⚡ Lightweight · 🔧 Developer-Friendly · 🚀 HF Spaces Ready
 
-> A complete PHP development environment packed into a **single Docker container** — Apache (MPM Event), PHP 8.x (FPM), MariaDB, phpMyAdmin, FFmpeg, and a File Manager with optional integrated Web Terminal support.  
+> A complete PHP development environment packed into a **single Docker container** — Apache (MPM Event), PHP 8.x (FPM), MariaDB, Redis, phpMyAdmin, FFmpeg, and a File Manager with optional integrated Web Terminal support.  
 > Deploy on **Hugging Face Spaces** for free, or on any **VPS / local machine**.
 
 </div>
@@ -34,6 +34,7 @@
 - [🖥️ Deploy on VPS / Local Machine](#-deploy-on-vps--local-machine)
 - [🌐 Access URLs](#-access-urls)
 - [🗄️ Database Setup](#-database-setup)
+- [🎬 PHP Media Processing Example](#-php-media-processing-example)
 - [💾 Persistent Storage](#-persistent-storage)
 - [⚙️ Environment Variables & .env](#-environment-variables--env)
 - [📁 File Manager](#-file-manager)
@@ -52,10 +53,11 @@
 | 🐘 **PHP 8.x (FPM)** | High-performance PHP runtime with OPcache pre-enabled |
 | 🌐 **Apache (MPM Event)** | Configured for concurrent requests with `mod_rewrite` and `.htaccess` support |
 | 🗄️ **MariaDB** | Full database engine with phpMyAdmin UI at `/sql` |
+| 🚀 **Redis** | Built-in in-memory data structure store for caching |
 | 📁 **File Manager** | Custom File Manager at `/files` |
 | 💻 **Web Terminal** | Browser-based shell support through the bundled File Manager |
 | ⚙️ **.env Support** | Auto-loads `/var/www/localhost/htdocs/.env` at startup |
-| 💾 **Persistent Storage** | `/data` mount recommended/required for preserving database and site files |
+| 💾 **Persistent Storage** | `/data` mount recommended/required for preserving database, sessions, backups, and site files |
 | 🔒 **Non-root** | Runs as non-root appuser (UID 1000) for improved container security |
 | 🐳 **Alpine Base** | Lightweight Linux base image |
 | 🎬 **FFmpeg** | Audio/video processing toolkit for media workflows |
@@ -73,6 +75,7 @@ Alpine Linux latest
 ├── Apache 2 (MPM Event) → High-concurrency Web server on port 7860
 ├── PHP 8.x (PHP-FPM)    → FastCGI Process Manager with common extensions
 ├── MariaDB              → Database server
+├── Redis                → In-memory data structure store & cache
 ├── phpMyAdmin           → Database UI at /sql
 ├── File Manager         → Custom File Manager at /files
 ├── Web Terminal         → Integrated if supported by bundled File Manager
@@ -348,16 +351,34 @@ if ($conn->connect_error) {
 
 echo 'Database connected successfully!';
 
-```
-## 💾 Persistent Storage
-MariaDB stores its data at:
-```txt
-/data/mysql
 
 ```
-Website files are stored at:
+## 🎬 PHP Media Processing Example
+Because this stack includes FFmpeg, you can easily process media files (great for streaming apps or multimedia platforms) directly via PHP.
+```php
+<?php
+// Example: Extracting a thumbnail from a video
+$videoPath = '/data/htdocs/uploads/video.mp4';
+$thumbPath = '/data/htdocs/uploads/thumb.jpg';
+
+// Generate thumbnail at the 2-second mark
+$output = shell_exec("ffmpeg -i $videoPath -ss 00:00:02.000 -vframes 1 $thumbPath 2>&1");
+
+if (file_exists($thumbPath)) {
+    echo "Thumbnail generated successfully!";
+} else {
+    echo "Error generating thumbnail: " . $output;
+}
+?>
+
+```
+## 💾 Persistent Storage
+The container automatically organizes persistent data in the /data directory:
 ```txt
-/data/htdocs
+/data/htdocs   → Website files (Document Root)
+/data/mysql    → MariaDB database files
+/data/sessions → PHP active user sessions
+/data/backups  → Automated daily DB (.sql) & File (.tar.gz) backups
 
 ```
 The container symlinks the Apache web root:
@@ -370,6 +391,7 @@ If /data is not mounted as persistent storage:
  * MariaDB may be reinitialized after restart/rebuild
  * Uploaded site files may be lost
  * Database tables and records may reset
+ * Sessions will expire instantly on restart
 ### Hugging Face Persistent Storage
 Set:
 | Field | Value |
@@ -734,8 +756,8 @@ Instead of:
 ## 🔒 Security Notes
 Before going public:
  1. Change the default database password.
- 2. Change SQL_PATH from /sql to a secret path.
- 3. Change FILES_PATH from /files to a secret path.
+ 2. Change SQL_PATH from sql to a secret path.
+ 3. Change FILES_PATH from files to a secret path.
  4. Keep Hugging Face Persistent Storage private.
  5. Avoid uploading secrets directly into public repositories.
  6. Keep .env out of Git.
@@ -752,7 +774,7 @@ FILES_PATH=hidden-file-panel
 ```
 ## 💡 Pro Tips
  * 📂 **Website Root:** Upload your project files to /var/www/localhost/htdocs
- * 💾 **Persistent Storage:** Mount /data so database and files survive restarts
+ * 💾 **Persistent Storage:** Mount /data so database, sessions, backups, and files survive restarts
  * 🗜️ **Fast Deploys:** Upload a .zip through File Manager and extract it on the server
  * ⚡ **OPcache:** Already enabled for better PHP performance
  * 🔒 **Public Hosting:** Change FILES_PATH, SQL_PATH, and MYSQL_PASSWORD
@@ -783,6 +805,5 @@ git push origin feature/amazing-feature
  5. Open a Pull Request
 <div align="center">
 <b>Made with ❤️ for developers who love simplicity</b>
-
 ⭐ <b>If this helped you, please give it a Star!</b> ⭐
 </div>
