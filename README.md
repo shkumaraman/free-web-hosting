@@ -64,7 +64,7 @@
 | ☁️ **HF Spaces Ready** | Designed for Hugging Face Docker Spaces |
 | 🔀 **Custom Domain** | Optional custom domain proxy via Cloudflare Workers |
 
-> ⚠️ **Resource Warning:** By default, this container is optimized for high performance and allocates ~5GB of RAM for the MariaDB buffer pool. Ensure your server has at least **8GB+ RAM**. If deploying on low-resource environments (1GB/2GB RAM), modify `/etc/my.cnf.d/16gb.cnf` in the Dockerfile before building.
+> 💡 **Resource Friendly:** This container is heavily optimized for low-resource environments like the Hugging Face free tier. MariaDB is pre-configured with a conservative 128MB buffer pool and optimized caching, making it run perfectly on servers with as little as **1GB to 2GB RAM**.
 
 ---
 
@@ -222,7 +222,7 @@ https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
 ## 🖥️ Deploy on VPS / Local Machine
 ### Prerequisites
  * Docker installed
- * Minimum 8GB+ RAM (or adjust the MariaDB configuration in the Dockerfile for lower RAM).
+ * Works smoothly on low-resource instances (1GB+ RAM).
 ### Step 1 — Clone and Build
 ```bash
 git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
