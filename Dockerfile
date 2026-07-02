@@ -103,10 +103,13 @@ RUN rm -f /etc/my.cnf.d/hf.cnf && \
     ln -s /data/config/mariadb.cnf /etc/my.cnf.d/hf.cnf
 
 RUN sed -i "s|'localhost'|'127.0.0.1'|g" /etc/phpmyadmin/config.inc.php && \
+    sed -i '/?>/d' /etc/phpmyadmin/config.inc.php && \
     cat << EOF >> /etc/phpmyadmin/config.inc.php
 @include('/data/config/pma_secret.php');
 \$cfg['Servers'][1]['host'] = '127.0.0.1';
 \$cfg['Servers'][1]['port'] = '3306';
+\$cfg['Servers'][1]['controluser'] = 'pma';
+\$cfg['Servers'][1]['controlpass'] = 'pmapass123';
 \$cfg['Servers'][1]['pmadb'] = 'phpmyadmin';
 \$cfg['Servers'][1]['bookmarktable'] = 'pma__bookmark';
 \$cfg['Servers'][1]['relation'] = 'pma__relation';
@@ -382,10 +385,11 @@ cat << SQL > /tmp/init.sql
 ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY '${ROOT_PASS}';
 CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE DATABASE IF NOT EXISTS phpmyadmin;
+CREATE USER IF NOT EXISTS 'pma'@'127.0.0.1' IDENTIFIED BY 'pmapass123';
+GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO 'pma'@'127.0.0.1';
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
 GRANT ALL PRIVILEGES ON *.* TO '${MYSQL_USER}'@'%' WITH GRANT OPTION;
-GRANT SELECT, INSERT, UPDATE, DELETE ON phpmyadmin.* TO '${MYSQL_USER}'@'%';
 FLUSH PRIVILEGES;
 SQL
 
@@ -395,10 +399,10 @@ echo ">>> Note: SQL init ignored (Already Configured)"
 rm -f /tmp/init.sql
 
 echo ">>> Checking phpMyAdmin tables..."
-CREATE_TABLES_SQL="$(find /usr/share/webapps/phpmyadmin /usr/share/phpmyadmin /usr/share -name create_tables.sql 2>/dev/null | head -n 1)"
-if [ -n "$CREATE_TABLES_SQL" ]; then
+CREATE_TABLES_SQL="/usr/share/webapps/phpmyadmin/sql/create_tables.sql"
+if [ -f "$CREATE_TABLES_SQL" ]; then
     mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" phpmyadmin -e "SHOW TABLES LIKE 'pma__bookmark';" 2>/dev/null | grep -q pma__bookmark || \
-    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" < "$CREATE_TABLES_SQL" 2>/dev/null || true
+    mariadb --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" phpmyadmin < "$CREATE_TABLES_SQL" 2>/dev/null || true
 fi
 
 echo ">>> Starting Redis..."
