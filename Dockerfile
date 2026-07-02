@@ -210,7 +210,17 @@ stop_all() {
     CODE="${1:-0}"
     [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
     [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
-    [ -n "$MYSQL_PID" ] && kill "$MYSQL_PID" 2>/dev/null || true
+    if [ -n "$MYSQL_PID" ] && kill -0 "$MYSQL_PID" 2>/dev/null; then
+        mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"$(cat /data/config/root_pass.txt 2>/dev/null)" shutdown 2>/dev/null || \
+        mariadb-admin --socket=/run/mysqld/mysqld.sock -u root shutdown 2>/dev/null || \
+        kill -TERM "$MYSQL_PID" 2>/dev/null || true
+        WAIT_TRIES=0
+        while kill -0 "$MYSQL_PID" 2>/dev/null; do
+            WAIT_TRIES=$((WAIT_TRIES+1))
+            [ "$WAIT_TRIES" -ge 30 ] && kill -KILL "$MYSQL_PID" 2>/dev/null && break
+            sleep 1
+        done
+    fi
     [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null || true
     [ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null || true
     wait 2>/dev/null || true
@@ -226,6 +236,14 @@ rm -f /data/mysql/tc.log /data/mysql/aria_log_control 2>/dev/null || true
 mkdir -p /data/htdocs /data/sessions /data/mysql /data/config /data/webapps /data/backups
 chown -R appuser:appgroup /data/sessions /data/mysql /data/config /data/webapps /data/backups 2>/dev/null || true
 chmod 700 /data/sessions 2>/dev/null || true
+
+find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf
+find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
+
+AVAIL_KB=$(df -Pk /data | tail -1 | awk '{print $4}')
+if [ "$AVAIL_KB" -lt 1048576 ]; then
+    echo ">>> WARNING: Low disk space on /data (${AVAIL_KB} KB left)"
+fi
 
 for app in phpmyadmin filemanager; do
     if [ ! -d "/data/webapps/$app" ]; then
@@ -253,6 +271,7 @@ max_allowed_packet=64M
 innodb_buffer_pool_size=128M
 innodb_log_file_size=64M
 innodb_flush_log_at_trx_commit=2
+innodb_flush_method=fsync
 skip-name-resolve
 DBEOF
 fi
@@ -280,10 +299,28 @@ fi
 ROOT_PASS=$(cat /data/config/root_pass.txt)
 
 start_mariadb_process() {
+    EXTRA_OPTS="$1"
     mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 \
         --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid \
-        --tmpdir=/tmp --innodb-use-native-aio=0 --skip-networking=OFF > /tmp/mariadb.log 2>&1 &
+        --tmpdir=/tmp --innodb-use-native-aio=0 --skip-networking=OFF $EXTRA_OPTS > /tmp/mariadb.log 2>&1 &
     MYSQL_PID="$!"
+}
+
+wait_mariadb_ready() {
+    local MAX_TRIES="$1"
+    local N=0
+    while true; do
+        if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
+            return 1
+        fi
+        if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || \
+           mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
+            return 0
+        fi
+        N=$((N+1))
+        [ "$N" -ge "$MAX_TRIES" ] && return 1
+        sleep 2
+    done
 }
 
 if [ ! -d /data/mysql/mysql ]; then
@@ -291,53 +328,54 @@ if [ ! -d /data/mysql/mysql ]; then
 fi
 
 echo ">>> Starting MariaDB..."
-start_mariadb_process
+start_mariadb_process ""
 
-TRIES=0
-while true; do
-    if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
-        echo ">>> ERROR: MariaDB crashed! DB might be corrupt."
-        cat /tmp/mariadb.log
-        echo ">>> AUTO-RECOVERY INITIATED: Moving corrupt DB files to backup and building a fresh one..."
-        BACKUP_DIR="/data/backups/mysql_corrupt_$(date +%s)"
-        mkdir -p "$BACKUP_DIR"
-        find /data/mysql -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR/" \; 2>/dev/null || true
-        mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
-        echo ">>> Starting MariaDB again after Auto-Recovery..."
-        start_mariadb_process
-        
-        REC_TRIES=0
-        while true; do
-            if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
-                echo ">>> FATAL: MariaDB crashed even after Auto-Recovery! Giving up."
-                cat /tmp/mariadb.log
-                stop_all 1
-            fi
-            if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
-                break 2
-            fi
-            REC_TRIES=$((REC_TRIES+1))
-            if [ "$REC_TRIES" -ge 60 ]; then
-                echo ">>> FATAL: MariaDB ping timeout after Auto-Recovery."
-                cat /tmp/mariadb.log
-                stop_all 1
-            fi
-            sleep 2
-        done
-    fi
-    
-    if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
-        break
-    fi
-    
-    TRIES=$((TRIES+1))
-    if [ "$TRIES" -ge 60 ]; then
-        echo ">>> ERROR: MariaDB ping timeout!"
+if ! wait_mariadb_ready 60; then
+    echo ">>> MariaDB failed normal start. Log:"
+    cat /tmp/mariadb.log
+    RECOVERED=0
+    for LEVEL in 1 2 3 4; do
+        echo ">>> Attempting InnoDB force recovery level ${LEVEL}..."
+        start_mariadb_process "--innodb-force-recovery=${LEVEL}"
+        if wait_mariadb_ready 30; then
+            echo ">>> Started under innodb_force_recovery=${LEVEL}. Dumping data before rebuild..."
+            DUMP_DIR="/data/backups/recovery_dump_$(date +%s)"
+            mkdir -p "$DUMP_DIR"
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || \
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || true
+            mariadb-admin --socket=/run/mysqld/mysqld.sock -u root shutdown 2>/dev/null || \
+            mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" shutdown 2>/dev/null || \
+            kill -TERM "$MYSQL_PID" 2>/dev/null || true
+            sleep 3
+            kill -0 "$MYSQL_PID" 2>/dev/null && kill -KILL "$MYSQL_PID" 2>/dev/null || true
+            RECOVERED=1
+            break
+        fi
+        kill -0 "$MYSQL_PID" 2>/dev/null && kill -KILL "$MYSQL_PID" 2>/dev/null || true
+    done
+
+    echo ">>> Rebuilding datadir from scratch..."
+    BACKUP_DIR="/data/backups/mysql_corrupt_$(date +%s)"
+    mkdir -p "$BACKUP_DIR"
+    find /data/mysql -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR/" \; 2>/dev/null || true
+    mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
+
+    echo ">>> Starting MariaDB again after rebuild..."
+    start_mariadb_process ""
+    if ! wait_mariadb_ready 60; then
+        echo ">>> FATAL: MariaDB crashed even after rebuild! Giving up."
         cat /tmp/mariadb.log
         stop_all 1
     fi
-    sleep 2
-done
+
+    if [ "$RECOVERED" -eq 1 ]; then
+        LATEST_DUMP=$(find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | tail -n 1)
+        if [ -n "$LATEST_DUMP" ] && [ -s "${LATEST_DUMP}/dump.sql" ]; then
+            echo ">>> Restoring recovered data from ${LATEST_DUMP}/dump.sql..."
+            mariadb --socket=/run/mysqld/mysqld.sock -u root < "${LATEST_DUMP}/dump.sql" 2>/dev/null || true
+        fi
+    fi
+fi
 
 echo ">>> MariaDB is ready. Configuring Databases & Users..."
 cat << SQL > /tmp/init.sql
@@ -405,7 +443,9 @@ echo ">>> Server is fully ready! Starting backup loop..."
         TS=$(date +%Y%m%d_%H%M%S)
         mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "/data/backups/db_${TS}.sql" 2>/dev/null || true
         tar -czf "/data/backups/files_${TS}.tar.gz" -C /data/htdocs . 2>/dev/null || true
-        find /data/backups -type f -mtime +7 -delete 2>/dev/null || true
+        find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
+        find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf
+        find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | head -n -3 | xargs -r rm -rf
     done
 ) &
 BACKUP_PID="$!"
