@@ -1437,7 +1437,7 @@ function promptAction(action) {
       closeModal('prompt-modal'); load(); showToast('Folder created','success');
     };
   } else {
-    document.getElementById('prompt-title').innerHTML = '<i class="fa-solid fa-file-plus"></i> New File';
+    document.getElementById('prompt-title').innerHTML = '<i class="fa-solid fa-file-medical"></i> New File';
     document.getElementById('prompt-input').placeholder = 'File Name';
     window._promptAction = async () => {
       const name = document.getElementById('prompt-input').value.trim();
