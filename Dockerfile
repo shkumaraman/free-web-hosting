@@ -147,7 +147,7 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "opcache.revalidate_freq=2" >> "{}" && \
     echo "realpath_cache_size=1024K" >> "{}" && \
     echo "realpath_cache_ttl=300" >> "{}" && \
-    echo "session.save_path=\"/data/sessions\"" >> "{}" && \
+    echo "session.save_path=\"/tmp/sessions\"" >> "{}" && \
     echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_max_filesize=512M" >> "{}" && \
@@ -172,12 +172,14 @@ RUN mkdir -p \
     /var/www/localhost/htdocs \
     /usr/share/webapps/filemanager \
     /etc/apache2/conf.d \
-    /var/log/apache2 && \
+    /var/log/apache2 \
+    /var/lib/mysql && \
     ln -sf /dev/stdout /var/log/apache2/access.log && \
     ln -sf /dev/stderr /var/log/apache2/error.log && \
-    curl -f -sSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php && \
-    [ -s /usr/share/webapps/filemanager/index.php ] && \
     rm -f /var/www/localhost/htdocs/index.html /var/www/localhost/htdocs/index.php
+
+COPY index.php* /usr/share/webapps/filemanager/
+RUN [ -f /usr/share/webapps/filemanager/index.php ] || curl -f -sSL https://raw.githubusercontent.com/shkumaraman/free-web-hosting/main/filemanager/index.php -o /usr/share/webapps/filemanager/index.php
 
 RUN chown -R appuser:appgroup \
     /run/mysqld \
@@ -190,10 +192,11 @@ RUN chown -R appuser:appgroup \
     /usr/share/webapps \
     /etc/my.cnf.d \
     /tmp \
-    /data && \
+    /data \
+    /var/lib/mysql && \
     chmod 1777 /tmp && \
     chmod 755 /run/mysqld && \
-    chmod -R u+rwX,go+rX /data /var/www/localhost /usr/share/webapps
+    chmod -R u+rwX,go+rX /data /var/www/localhost /usr/share/webapps /var/lib/mysql
 
 USER appuser
 RUN cd /usr/share/webapps/filemanager && \
@@ -209,21 +212,48 @@ HTTPD_PID=""
 REDIS_PID=""
 BACKUP_PID=""
 
+DATA_OK=1
+if ! ls -d /data >/dev/null 2>&1; then
+    echo ">>> WARNING: /data mount is unhealthy (Socket not connected or not mounted)!"
+    echo ">>> Falling back to ephemeral storage in /tmp..."
+    DATA_OK=0
+fi
+
+if [ "$DATA_OK" -eq 1 ]; then
+    DATA_DIR="/data"
+else
+    DATA_DIR="/tmp/data_fallback"
+fi
+
 stop_all() {
     CODE="${1:-0}"
     [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
     [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
+    
     if [ -n "$MYSQL_PID" ] && kill -0 "$MYSQL_PID" 2>/dev/null; then
-        mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"$(cat /data/config/root_pass.txt 2>/dev/null)" shutdown 2>/dev/null || \
+        echo ">>> Stopping MariaDB cleanly..."
+        mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"$(cat "$DATA_DIR/config/root_pass.txt" 2>/dev/null)" shutdown 2>/dev/null || \
         mariadb-admin --socket=/run/mysqld/mysqld.sock -u root shutdown 2>/dev/null || \
         kill -TERM "$MYSQL_PID" 2>/dev/null || true
+        
         WAIT_TRIES=0
         while kill -0 "$MYSQL_PID" 2>/dev/null; do
             WAIT_TRIES=$((WAIT_TRIES+1))
             [ "$WAIT_TRIES" -ge 30 ] && kill -KILL "$MYSQL_PID" 2>/dev/null && break
             sleep 1
         done
+        
+        if [ "$DATA_OK" -eq 1 ]; then
+            echo ">>> Syncing local database back to persistent /data/mysql..."
+            mkdir -p /data/mysql
+            chown -R appuser:appgroup /data/mysql 2>/dev/null || true
+            rm -rf /data/mysql/* /data/mysql/.* 2>/dev/null || true
+            cp -a /var/lib/mysql/. /data/mysql/ 2>/dev/null || true
+            chown -R appuser:appgroup /data/mysql 2>/dev/null || true
+            echo ">>> Database synced successfully."
+        fi
     fi
+    
     [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null || true
     [ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null || true
     wait 2>/dev/null || true
@@ -231,39 +261,49 @@ stop_all() {
 }
 trap 'stop_all 0' INT TERM
 
-mkdir -p /run/mysqld /run/php-fpm /run/apache2
-chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp 2>/dev/null || true
+mkdir -p /run/mysqld /run/php-fpm /run/apache2 /tmp/sessions
+chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp /tmp/sessions 2>/dev/null || true
+chmod 700 /tmp/sessions 2>/dev/null || true
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid 2>/dev/null || true
-rm -f /data/mysql/tc.log /data/mysql/aria_log_control 2>/dev/null || true
 
-mkdir -p /data/htdocs /data/sessions /data/mysql /data/config /data/webapps /data/backups
-chown -R appuser:appgroup /data/sessions /data/mysql /data/config /data/webapps /data/backups 2>/dev/null || true
-chmod 700 /data/sessions 2>/dev/null || true
+if [ "$DATA_OK" -eq 0 ]; then
+    mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups"
+    chown -R appuser:appgroup "$DATA_DIR" 2>/dev/null || true
+fi
 
-find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf
-find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
+rm -f "$DATA_DIR/mysql/tc.log" "$DATA_DIR/mysql/aria_log_control" 2>/dev/null || true
+mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups"
+chown -R appuser:appgroup "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups" 2>/dev/null || true
+chmod 700 "$DATA_DIR/sessions" 2>/dev/null || true
 
-AVAIL_KB=$(df -Pk /data | tail -1 | awk '{print $4}')
-if [ "$AVAIL_KB" -lt 1048576 ]; then
-    echo ">>> WARNING: Low disk space on /data (${AVAIL_KB} KB left)"
+if [ "$DATA_OK" -eq 1 ]; then
+    find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
+    find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
+    
+    AVAIL_KB=$(df -Pk /data 2>/dev/null | tail -1 | awk '{print $4}')
+    if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt 1048576 ] 2>/dev/null; then
+        echo ">>> WARNING: Low disk space on /data (${AVAIL_KB} KB left)"
+    fi
 fi
 
 for app in phpmyadmin filemanager; do
-    if [ ! -d "/data/webapps/$app" ]; then
-        mkdir -p "/data/webapps/$app"
-        cp -a "/usr/share/webapps/$app/." "/data/webapps/$app/" 2>/dev/null || true
+    if [ ! -d "$DATA_DIR/webapps/$app" ]; then
+        mkdir -p "$DATA_DIR/webapps/$app"
+        cp -a "/usr/share/webapps/$app/." "$DATA_DIR/webapps/$app/" 2>/dev/null || true
     fi
     rm -rf "/usr/share/webapps/$app" 2>/dev/null || true
-    ln -sfn "/data/webapps/$app" "/usr/share/webapps/$app"
+    ln -sfn "$DATA_DIR/webapps/$app" "/usr/share/webapps/$app"
 done
 
-if [ ! -f /data/config/pma_secret.php ]; then
+if [ ! -f "$DATA_DIR/config/pma_secret.php" ]; then
     BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
-    echo "<?php \$cfg['blowfish_secret'] = '${BLOWFISH}';" > /data/config/pma_secret.php
+    echo "<?php \$cfg['blowfish_secret'] = '${BLOWFISH}';" > "$DATA_DIR/config/pma_secret.php"
 fi
 
-if [ ! -f /data/config/mariadb.cnf ]; then
-    cat << 'DBEOF' > /data/config/mariadb.cnf
+sed -i "s|/data/config/pma_secret.php|$DATA_DIR/config/pma_secret.php|g" /etc/phpmyadmin/config.inc.php 2>/dev/null || true
+
+if [ ! -f "$DATA_DIR/config/mariadb.cnf" ]; then
+    cat << 'DBEOF' > "$DATA_DIR/config/mariadb.cnf"
 [mariadb]
 max_connections=50
 thread_cache_size=16
@@ -279,10 +319,12 @@ skip-name-resolve
 DBEOF
 fi
 
+ln -sfn "$DATA_DIR/config/mariadb.cnf" /etc/my.cnf.d/hf.cnf 2>/dev/null || true
+
 if [ ! -L /var/www/localhost/htdocs ]; then
-    cp -a /var/www/localhost/htdocs/. /data/htdocs/ 2>/dev/null || true
+    cp -a /var/www/localhost/htdocs/. "$DATA_DIR/htdocs/" 2>/dev/null || true
     rm -rf /var/www/localhost/htdocs 2>/dev/null || true
-    ln -sfn /data/htdocs /var/www/localhost/htdocs
+    ln -sfn "$DATA_DIR/htdocs" /var/www/localhost/htdocs
 fi
 
 if [ -f /var/www/localhost/htdocs/.env ]; then
@@ -296,14 +338,14 @@ Alias /${SQL_PATH:-sql} /usr/share/webapps/phpmyadmin
 Alias /${FILES_PATH:-files} /usr/share/webapps/filemanager
 APACHECONF
 
-if [ ! -f /data/config/root_pass.txt ]; then
-    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24 > /data/config/root_pass.txt
+if [ ! -f "$DATA_DIR/config/root_pass.txt" ]; then
+    cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 24 > "$DATA_DIR/config/root_pass.txt"
 fi
-ROOT_PASS=$(cat /data/config/root_pass.txt)
+ROOT_PASS=$(cat "$DATA_DIR/config/root_pass.txt")
 
 start_mariadb_process() {
     EXTRA_OPTS="$1"
-    mariadbd --datadir=/data/mysql --bind-address=127.0.0.1 --port=3306 \
+    mariadbd --datadir=/var/lib/mysql --bind-address=127.0.0.1 --port=3306 \
         --socket=/run/mysqld/mysqld.sock --pid-file=/run/mysqld/mysqld.pid \
         --tmpdir=/tmp --innodb-use-native-aio=0 --skip-networking=OFF $EXTRA_OPTS > /tmp/mariadb.log 2>&1 &
     MYSQL_PID="$!"
@@ -326,8 +368,25 @@ wait_mariadb_ready() {
     done
 }
 
-if [ ! -d /data/mysql/mysql ]; then
-    mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
+mkdir -p /var/lib/mysql
+chown -R appuser:appgroup /var/lib/mysql 2>/dev/null || true
+chmod 700 /var/lib/mysql 2>/dev/null || true
+
+if [ "$DATA_OK" -eq 1 ] && [ -d /data/mysql/mysql ]; then
+    echo ">>> Copying persistent database from /data/mysql to local /var/lib/mysql..."
+    rm -rf /var/lib/mysql/* /var/lib/mysql/.* 2>/dev/null || true
+    cp -a /data/mysql/. /var/lib/mysql/ 2>/dev/null || true
+    chown -R appuser:appgroup /var/lib/mysql 2>/dev/null || true
+elif [ "$DATA_OK" -eq 0 ] && [ -d "$DATA_DIR/mysql/mysql" ]; then
+    echo ">>> Copying fallback database to local /var/lib/mysql..."
+    rm -rf /var/lib/mysql/* /var/lib/mysql/.* 2>/dev/null || true
+    cp -a "$DATA_DIR/mysql/." /var/lib/mysql/ 2>/dev/null || true
+    chown -R appuser:appgroup /var/lib/mysql 2>/dev/null || true
+fi
+
+if [ ! -d /var/lib/mysql/mysql ]; then
+    echo ">>> Initializing local database in /var/lib/mysql..."
+    mariadb-install-db --datadir=/var/lib/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
 fi
 
 echo ">>> Starting MariaDB..."
@@ -342,7 +401,7 @@ if ! wait_mariadb_ready 60; then
         start_mariadb_process "--innodb-force-recovery=${LEVEL}"
         if wait_mariadb_ready 30; then
             echo ">>> Started under innodb_force_recovery=${LEVEL}. Dumping data before rebuild..."
-            DUMP_DIR="/data/backups/recovery_dump_$(date +%s)"
+            DUMP_DIR="$DATA_DIR/backups/recovery_dump_$(date +%s)"
             mkdir -p "$DUMP_DIR"
             mariadb-dump --socket=/run/mysqld/mysqld.sock -u root --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || \
             mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || true
@@ -358,10 +417,10 @@ if ! wait_mariadb_ready 60; then
     done
 
     echo ">>> Rebuilding datadir from scratch..."
-    BACKUP_DIR="/data/backups/mysql_corrupt_$(date +%s)"
+    BACKUP_DIR="$DATA_DIR/backups/mysql_corrupt_$(date +%s)"
     mkdir -p "$BACKUP_DIR"
-    find /data/mysql -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR/" \; 2>/dev/null || true
-    mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
+    find /var/lib/mysql -mindepth 1 -maxdepth 1 -exec mv {} "$BACKUP_DIR/" \; 2>/dev/null || true
+    mariadb-install-db --datadir=/var/lib/mysql --skip-test-db --user=appuser --auth-root-authentication-method=normal
 
     echo ">>> Starting MariaDB again after rebuild..."
     start_mariadb_process ""
@@ -372,7 +431,7 @@ if ! wait_mariadb_ready 60; then
     fi
 
     if [ "$RECOVERED" -eq 1 ]; then
-        LATEST_DUMP=$(find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | tail -n 1)
+        LATEST_DUMP=$(find "$DATA_DIR/backups" -maxdepth 1 -type d -name 'recovery_dump_*' | sort | tail -n 1)
         if [ -n "$LATEST_DUMP" ] && [ -s "${LATEST_DUMP}/dump.sql" ]; then
             echo ">>> Restoring recovered data from ${LATEST_DUMP}/dump.sql..."
             mariadb --socket=/run/mysqld/mysqld.sock -u root < "${LATEST_DUMP}/dump.sql" 2>/dev/null || true
@@ -443,18 +502,22 @@ fi
 echo ">>> Server is fully ready! Starting backup loop..."
 (
     while true; do
-        sleep 86400
+        sleep 3600
         TS=$(date +%Y%m%d_%H%M%S)
-        mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "/data/backups/db_${TS}.sql" 2>/dev/null || true
-        tar -czf "/data/backups/files_${TS}.tar.gz" -C /data/htdocs . 2>/dev/null || true
-        find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
-        find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf
-        find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | head -n -3 | xargs -r rm -rf
+        if [ "$DATA_OK" -eq 1 ]; then
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "/data/backups/db_${TS}.sql" 2>/dev/null || true
+            tar -czf "/data/backups/files_${TS}.tar.gz" -C /data/htdocs . 2>/dev/null || true
+            find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
+            find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
+            find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
+        else
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "$DATA_DIR/backups/db_${TS}.sql" 2>/dev/null || true
+        fi
     done
 ) &
 BACKUP_PID="$!"
 
-chmod -R u+rwX,go+rX /data/htdocs 2>/dev/null || true
+chmod -R u+rwX,go+rX "$DATA_DIR/htdocs" 2>/dev/null || true
 
 while true; do
     if ! kill -0 "$HTTPD_PID" 2>/dev/null; then echo ">>> ALERT: Apache died!"; wait "$HTTPD_PID" 2>/dev/null || true; stop_all 1; fi
