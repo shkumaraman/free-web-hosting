@@ -329,9 +329,6 @@ if (isset($_GET['api'])) {
                 $sftp->put($req['path'] ?? $target_path, $req['content']);
             } elseif ($action === 'chmod') {
                 $sftp->chmod(octdec($req['perms']), $req['path'] ?? $target_path);
-            } elseif ($action === 'diskusage') {
-                echo json_encode(['status' => 'success', 'total' => 0, 'free' => 0, 'used' => 0]);
-                exit;
             }
             echo json_encode(['status' => 'success']);
         } catch (Exception $e) {
@@ -451,45 +448,6 @@ if (isset($_GET['api'])) {
         } elseif ($action === 'chmod') {
             $target = get_absolute_path($req['path']);
             chmod($target, octdec($req['perms']));
-        } elseif ($action === 'diskusage') {
-            $total = @disk_total_space($current_path) ?: 0;
-            $free  = @disk_free_space($current_path) ?: 0;
-            
-            if ($total <= 0) {
-                $df_out = @shell_exec('df -P ' . escapeshellarg($current_path));
-                if ($df_out) {
-                    $lines = explode("\n", trim($df_out));
-                    if (count($lines) >= 2) {
-                        $cols = preg_split('/\s+/', $lines[1]);
-                        if (count($cols) >= 4) {
-                            $total = (float)$cols[1] * 1024;
-                            $free  = (float)$cols[3] * 1024;
-                        }
-                    }
-                }
-            }
-            
-            $used = $total - $free;
-            if ($used < 0) {
-                $used = 0;
-            }
-            
-            $custom_limit_gb = getenv('TOTAL_DISK_GB');
-            if ($custom_limit_gb !== false) {
-                $total = (float)$custom_limit_gb * 1024 * 1024 * 1024;
-                if ($used > $total) {
-                    $used = $total;
-                }
-                $free = $total - $used;
-            }
-            
-            echo json_encode([
-                'status' => 'success',
-                'total' => $total,
-                'free' => $free,
-                'used' => $used
-            ]);
-            exit;
         } elseif ($action === 'sysinfo') {
             echo json_encode([
                 'status' => 'success',
@@ -775,23 +733,6 @@ input,textarea{font-family:inherit}
       <i class="fa-brands fa-github" style="color:var(--purple);"></i> SHKUMARAMAN
     </a>
 
-    <div style="flex:1"></div>
-    <div class="disk-card" id="disk-card">
-      <div class="disk-label">
-        <span><i class="fa-solid fa-hard-drive"></i> Disk Space</span>
-        <span id="disk-percent" style="font-weight:600;color:var(--text)">0%</span>
-      </div>
-      <div class="disk-bar">
-        <div class="disk-fill" id="disk-fill" style="width: 0%"></div>
-      </div>
-      <div style="font-size:12px;color:var(--text2);margin-top:8px;display:flex;justify-content:space-between" id="disk-detail">
-        <span>Used: <strong id="disk-used" style="color:var(--text)">0 B</strong></span>
-        <span>Free: <strong id="disk-free" style="color:var(--text)">0 B</strong></span>
-      </div>
-      <div style="font-size:11px;color:var(--text2);text-align:right;margin-top:4px">
-        Total: <span id="disk-total">0 B</span>
-      </div>
-    </div>
   </div>
 
   <div id="content">
@@ -1038,28 +979,6 @@ async function load(path) {
   renderBreadcrumb();
   render();
   updateStatusBar();
-  if (!remoteMode) loadDiskUsage();
-  else document.getElementById('disk-card').style.display = 'none';
-}
-
-async function loadDiskUsage() {
-  const d = await api('diskusage');
-  if (d.status !== 'success' || !d.total || d.total <= 0) {
-    document.getElementById('disk-card').style.display = 'none';
-    return;
-  }
-  document.getElementById('disk-card').style.display = '';
-  
-  const total = d.total;
-  const free = d.free !== undefined ? d.free : 0;
-  const used = d.used !== undefined ? d.used : (total - free);
-  const percent = total > 0 ? Math.round((used / total) * 100) : 0;
-  
-  document.getElementById('disk-percent').textContent = percent + '%';
-  document.getElementById('disk-fill').style.width = percent + '%';
-  document.getElementById('disk-used').textContent = fmtSize(used);
-  document.getElementById('disk-free').textContent = fmtSize(free);
-  document.getElementById('disk-total').textContent = fmtSize(total);
 }
 
 function getIcon(item) {
