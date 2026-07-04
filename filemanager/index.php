@@ -475,27 +475,19 @@ if (isset($_GET['api'])) {
             }
             
             $custom_limit_gb = getenv('TOTAL_DISK_GB');
-            $is_hf = getenv('SPACE_ID') !== false || file_exists('/data');
-            
             if ($custom_limit_gb !== false) {
-                $total_limit = (float)$custom_limit_gb * 1024 * 1024 * 1024;
-            } elseif ($total > 1024 * 1024 * 1024 * 1024 || $is_hf) {
-                $total_limit = 20 * 1024 * 1024 * 1024;
-            } else {
-                $total_limit = $total;
+                $total = (float)$custom_limit_gb * 1024 * 1024 * 1024;
+                if ($used > $total) {
+                    $used = $total;
+                }
+                $free = $total - $used;
             }
-            
-            if ($used > $total_limit) {
-                $total_limit = $used;
-            }
-            
-            $free_limit = $total_limit - $used;
             
             echo json_encode([
                 'status' => 'success',
-                'total' => $total_limit,
-                'used' => $used,
-                'free' => $free_limit
+                'total' => $total,
+                'free' => $free,
+                'used' => $used
             ]);
             exit;
         } elseif ($action === 'sysinfo') {
@@ -787,12 +779,18 @@ input,textarea{font-family:inherit}
     <div class="disk-card" id="disk-card">
       <div class="disk-label">
         <span><i class="fa-solid fa-hard-drive"></i> Disk Space</span>
-        <span id="disk-percent">0%</span>
+        <span id="disk-percent" style="font-weight:600;color:var(--text)">0%</span>
       </div>
-      <div class="disk-bar" style="margin-top: 2px; margin-bottom: 8px;">
+      <div class="disk-bar">
         <div class="disk-fill" id="disk-fill" style="width: 0%"></div>
       </div>
-      <div style="font-size:12px;font-weight:500;color:var(--text2);" id="disk-detail">Loading…</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:8px;display:flex;justify-content:space-between" id="disk-detail">
+        <span>Used: <strong id="disk-used" style="color:var(--text)">0 B</strong></span>
+        <span>Free: <strong id="disk-free" style="color:var(--text)">0 B</strong></span>
+      </div>
+      <div style="font-size:11px;color:var(--text2);text-align:right;margin-top:4px">
+        Total: <span id="disk-total">0 B</span>
+      </div>
     </div>
   </div>
 
@@ -1051,13 +1049,17 @@ async function loadDiskUsage() {
     return;
   }
   document.getElementById('disk-card').style.display = '';
-  const total = d.total;
-  const used = d.used || 0;
-  const pct = Math.min(100, Math.max(0, Math.round((used / total) * 100)));
   
-  document.getElementById('disk-percent').textContent = pct + '%';
-  document.getElementById('disk-fill').style.width = pct + '%';
-  document.getElementById('disk-detail').textContent = `${fmtSize(used)} of ${fmtSize(total)} used`;
+  const total = d.total;
+  const free = d.free !== undefined ? d.free : 0;
+  const used = d.used !== undefined ? d.used : (total - free);
+  const percent = total > 0 ? Math.round((used / total) * 100) : 0;
+  
+  document.getElementById('disk-percent').textContent = percent + '%';
+  document.getElementById('disk-fill').style.width = percent + '%';
+  document.getElementById('disk-used').textContent = fmtSize(used);
+  document.getElementById('disk-free').textContent = fmtSize(free);
+  document.getElementById('disk-total').textContent = fmtSize(total);
 }
 
 function getIcon(item) {
