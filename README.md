@@ -90,6 +90,7 @@ Alpine Linux latest
 ├── FFmpeg               → Audio/video processing
 └── Tini                 → Minimal init system for clean process handling
 
+
 ```
 ## 🐘 PHP Extensions
 | Extension | Purpose |
@@ -155,6 +156,7 @@ Only the Dockerfile is needed in your Space repository:
 your-space/
 └── Dockerfile    ✅ only this file is needed here
 
+
 ```
 You can drag and drop the Dockerfile in the **Files** tab, or push via Git:
 ```bash
@@ -165,6 +167,7 @@ git add Dockerfile
 git commit -m "Add Dockerfile"
 git push
 
+
 ```
 > ⚠️ Do **not** place your project files directly in the Space repository.
 > Once the Space is live, upload your project using the File Manager at /files.
@@ -173,12 +176,14 @@ Recommended upload path:
 ```txt
 /var/www/localhost/htdocs
 
+
 ```
 ### Step 3 — Set Environment Variables
 On Hugging Face, environment variables are configured in **Space Settings**, not in the command line.
 Open your Space:
 ```txt
 Settings → Variables and Secrets
+
 
 ```
 Add these variables:
@@ -189,13 +194,14 @@ Add these variables:
 | MYSQL_DATABASE | admin | Default database name |
 | SQL_PATH | sql | URL path for phpMyAdmin |
 | FILES_PATH | files | URL path for File Manager |
-Example:
+| Example: |  |  |
 ```env
 MYSQL_USER=admin
 MYSQL_PASSWORD=strong-password-here
 MYSQL_DATABASE=mydb
 SQL_PATH=mysecretdb
 FILES_PATH=mysecretfiles
+
 
 ```
 ### Step 4 — Mount Persistent Storage
@@ -204,6 +210,7 @@ FILES_PATH=mysecretfiles
 Go to:
 ```txt
 Settings → Persistent Storage
+
 
 ```
 Add storage with:
@@ -218,6 +225,7 @@ Your live URL:
 ```txt
 https://YOUR_USERNAME-YOUR_SPACE_NAME.hf.space/
 
+
 ```
 ## 🖥️ Deploy on VPS / Local Machine
 ### Prerequisites
@@ -229,6 +237,7 @@ git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.c
 cd YOUR_REPO_NAME
 
 docker build -t php-lamp .
+
 
 ```
 ### Option A — Docker Run
@@ -243,6 +252,7 @@ docker run -d \
   -e FILES_PATH=files \
   --name php-lamp \
   php-lamp
+
 
 ```
 ### Option B — Docker Compose
@@ -265,10 +275,12 @@ services:
 volumes:
   php_lamp_data:
 
+
 ```
 Run:
 ```bash
 docker compose up -d
+
 
 ```
 ### Access Your Server
@@ -276,10 +288,12 @@ docker compose up -d
 http://localhost:7860/      → Local machine
 http://YOUR_VPS_IP:7860/    → Remote VPS
 
+
 ```
 On VPS, open port 7860 in your firewall:
 ```bash
 sudo ufw allow 7860
+
 
 ```
 ## 🌐 Access URLs
@@ -288,15 +302,17 @@ sudo ufw allow 7860
 | 🏠 **Website** | / | — |
 | 🗄️ **Database UI** | /sql | SQL_PATH |
 | 📁 **File Manager** | /files | FILES_PATH |
-Web root directory:
+| Web root directory: |  |  |
 ```txt
 /var/www/localhost/htdocs
+
 
 ```
 All tool paths are customizable via environment variables. For example:
 ```env
 SQL_PATH=x7k2mdb
 FILES_PATH=x7k2files
+
 
 ```
 Then access:
@@ -305,6 +321,7 @@ Then access:
 /files     ❌ no longer used
 /x7k2mdb   ✅ phpMyAdmin
 /x7k2files ✅ File Manager
+
 
 ```
 ## 🗄️ Database Setup
@@ -316,6 +333,7 @@ Database : admin
 Host     : 127.0.0.1
 Port     : 3306
 
+
 ```
 > ⚠️ Change the password before exposing your app publicly.
 > 
@@ -323,6 +341,7 @@ Port     : 3306
 **On Hugging Face:**
 ```txt
 Space → Settings → Variables and Secrets
+
 
 ```
 **On VPS / Local:**
@@ -332,6 +351,7 @@ Example:
 MYSQL_USER=myuser
 MYSQL_PASSWORD=very-strong-password
 MYSQL_DATABASE=myapp
+
 
 ```
 ### PHP Database Connection Example
@@ -350,6 +370,7 @@ if ($conn->connect_error) {
 }
 
 echo 'Database connected successfully!';
+
 
 
 ```
@@ -371,6 +392,7 @@ if (file_exists($thumbPath)) {
 }
 ?>
 
+
 ```
 ## 💾 Persistent Storage
 The container automatically organizes persistent data in the /data directory:
@@ -378,12 +400,14 @@ The container automatically organizes persistent data in the /data directory:
 /data/htdocs   → Website files (Document Root)
 /data/mysql    → MariaDB database files
 /data/sessions → PHP active user sessions
-/data/backups  → Automated daily DB (.sql) & File (.tar.gz) backups
+/data/backups  → Automated hourly DB (.sql) & File (.tar.gz) backups
+
 
 ```
 The container symlinks the Apache web root:
 ```txt
 /var/www/localhost/htdocs → /data/htdocs
+
 
 ```
 ### Why /data Matters
@@ -406,10 +430,12 @@ On first boot:
 ```bash
 mariadb-install-db --datadir=/data/mysql --skip-test-db --user=appuser
 
+
 ```
 Every boot:
 ```bash
 mariadbd --datadir=/data/mysql --bind-address=127.0.0.1
+
 
 ```
 You do not need to run these manually. The startup script handles it.
@@ -420,6 +446,7 @@ You can configure your PHP app using a .env file for VPS/Local deployments.
 Place it here:
 ```txt
 /var/www/localhost/htdocs/.env
+
 
 ```
 The server automatically loads it at startup before Apache starts.
@@ -452,6 +479,7 @@ MAIL_PORT=587
 MAIL_USERNAME=your@email.com
 MAIL_PASSWORD=yourpassword
 
+
 ```
 ### Accessing Variables in PHP
 ```php
@@ -459,6 +487,7 @@ $appName = getenv('APP_NAME');
 $debug   = getenv('APP_DEBUG');
 
 echo $appName;
+
 
 ```
 ### .env Rules
@@ -468,10 +497,11 @@ echo $appName;
  * Use # for full-line comments
  * Avoid inline comments
  * Never commit .env to Git
-Correct:
+   Correct:
 ```env
 APP_NAME=MyApp
 APP_DEBUG=false
+
 
 ```
 Incorrect:
@@ -479,31 +509,37 @@ Incorrect:
 APP_NAME = MyApp
 APP_DEBUG=false # production mode
 
+
 ```
 ## 📁 File Manager
 The File Manager is available at:
 ```txt
 /files
 
+
 ```
 Or at your custom path:
 ```txt
 /${FILES_PATH}
+
 
 ```
 Example:
 ```env
 FILES_PATH=mysecretfiles
 
+
 ```
 Then open:
 ```txt
 https://YOUR_SPACE_URL/mysecretfiles
 
+
 ```
 Recommended upload directory:
 ```txt
 /var/www/localhost/htdocs
+
 
 ```
 > 🔒 Security tip: Change FILES_PATH to a hard-to-guess path before exposing your app publicly.
@@ -514,6 +550,7 @@ Open:
 ```txt
 /files
 
+
 ```
 Then click the **Terminal** button in the File Manager navigation bar.
 ### System Monitoring
@@ -522,12 +559,14 @@ free -h
 df -h
 du -sh *
 
+
 ```
 ### File Navigation
 ```bash
 pwd
 ls -la
 cd folder
+
 
 ```
 ### Developer Commands
@@ -538,6 +577,7 @@ git --version
 unzip file.zip
 nano file.php
 
+
 ```
 ### Archive Commands
 ```bash
@@ -545,11 +585,13 @@ zip -r project.zip project/
 unzip project.zip
 bsdtar -xf archive.tar.gz
 
+
 ```
 ### Media Commands
 ```bash
 ffmpeg -version
 ffmpeg -i input.mp4 output.mp3
+
 
 ```
 ## 🔀 Custom Domain via Cloudflare Workers
@@ -679,6 +721,7 @@ export default {
   },
 };
 
+
 ```
 Important:
 ```txt
@@ -686,10 +729,12 @@ Replace YOUR_USERNAME-YOUR_SPACE_NAME.hf.space with your real HF Space hostname.
 Do not include https://
 Do not include a trailing slash
 
+
 ```
 Example:
 ```js
 const backendHost = "my-awesome-app.hf.space";
+
 
 ```
 ### Step 4 — Attach Your Domain to the Worker
@@ -708,24 +753,28 @@ const backendHost = "my-awesome-app.hf.space";
 ```txt
 [example.com/](https://example.com/)*
 
+
 ```
 For all subdomains:
 ```txt
 *[.example.com/](https://.example.com/)*
 
+
 ```
  4. Click **Add route**
 ### Step 5 — Access Your App
 ```txt
-[https://example.com/](https://example.com/)          → Website
-[https://example.com/sql](https://example.com/sql)       → phpMyAdmin
-[https://example.com/files](https://example.com/files)     → File Manager
+[https://example.com/](https://example.com/)         → Website
+[https://example.com/sql](https://example.com/sql)        → phpMyAdmin
+[https://example.com/files](https://example.com/files)      → File Manager
+
 
 ```
 If you customized paths:
 ```txt
 [https://example.com/mysecretdb](https://example.com/mysecretdb)     → phpMyAdmin
 [https://example.com/mysecretfiles](https://example.com/mysecretfiles)  → File Manager
+
 
 ```
 ### Troubleshooting
@@ -747,10 +796,12 @@ Use:
 ```txt
 [app.example.com/](https://app.example.com/)*
 
+
 ```
 Instead of:
 ```txt
 *[.example.com/](https://.example.com/)*
+
 
 ```
 ## 🔒 Security Notes
@@ -763,13 +814,14 @@ Before going public:
  6. Keep .env out of Git.
  7. Consider adding authentication in front of the File Manager for public deployments.
  8. Do not use admin/admin credentials on a public server.
-Recommended environment variables:
+   Recommended environment variables:
 ```env
 MYSQL_USER=admin
 MYSQL_PASSWORD=use-a-long-random-password
 MYSQL_DATABASE=myapp
 SQL_PATH=hidden-db-panel
 FILES_PATH=hidden-file-panel
+
 
 ```
 ## 💡 Pro Tips
@@ -791,19 +843,22 @@ Contributions, issues, and feature requests are welcome.
 ```bash
 git checkout -b feature/amazing-feature
 
+
 ```
  3. Commit your changes:
 ```bash
 git commit -m "Add amazing feature"
+
 
 ```
  4. Push to the branch:
 ```bash
 git push origin feature/amazing-feature
 
+
 ```
  5. Open a Pull Request
-<div align="center">
-<b>Made with ❤️ for developers who love simplicity</b>
-⭐ <b>If this helped you, please give it a Star!</b> ⭐
-</div>
+   <div align="center">
+   <b>Made with ❤️ for developers who love simplicity</b>
+   ⭐ <b>If this helped you, please give it a Star!</b> ⭐
+   </div>
