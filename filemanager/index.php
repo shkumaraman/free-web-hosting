@@ -791,7 +791,7 @@ input,textarea{font-family:inherit}
     <div class="nav-item" id="nav-remote" onclick="remoteMode ? loadRemote() : promptSFTP()"><i class="fa-solid fa-network-wired"></i> <span id="sftp-label">Connect SFTP</span></div>
     <div class="sidebar-section">Quick Actions</div>
     <div class="nav-item" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> New Folder</div>
-    <div class="nav-item" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-circle-plus"></i> New File</div>
+    <div class="nav-item" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-medical"></i> New File</div>
     <div class="nav-item" onclick="openUpload()"><i class="fa-solid fa-cloud-arrow-up"></i> Upload Files</div>
     <div class="nav-item" onclick="openSysInfo()"><i class="fa-solid fa-server"></i> Server Info</div>
     <div class="sidebar-section">View</div>
@@ -817,7 +817,7 @@ input,textarea{font-family:inherit}
       <button class="btn btn-ghost btn-sm btn-icon" onclick="load()"><i class="fa-solid fa-arrows-rotate"></i></button>
       <div class="tool-sep"></div>
       <button class="btn btn-ghost btn-sm" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> Folder</button>
-      <button class="btn btn-ghost btn-sm" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-circle-plus"></i> File</button>
+      <button class="btn btn-ghost btn-sm" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-medical"></i> File</button>
       <div class="tool-sep"></div>
       <button class="btn btn-ghost btn-sm" id="sel-btn" onclick="toggleMultiSelect()"><i class="fa-solid fa-check-double"></i> Multi-Select</button>
       <button class="btn btn-ghost btn-sm" id="sel-all-btn" onclick="selectAll()"><i class="fa-solid fa-square-check"></i> Select All</button>
