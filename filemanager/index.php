@@ -470,7 +470,53 @@ if (isset($_GET['api'])) {
             }
             
             $used = ($total > $free) ? ($total - $free) : 0;
-            echo json_encode(['status' => 'success', 'total' => $total, 'free' => $free, 'used' => $used]);
+            
+            $custom_limit_gb = getenv('TOTAL_DISK_GB');
+            $has_custom_limit = $custom_limit_gb !== false;
+            
+            $is_hf = getenv('SPACE_ID') !== false || file_exists('/data');
+            $is_cluster = $total > 1024 * 1024 * 1024 * 1024 || $is_hf;
+            
+            if ($is_cluster || $has_custom_limit) {
+                if ($has_custom_limit) {
+                    $total = (float)$custom_limit_gb * 1024 * 1024 * 1024;
+                }
+                
+                $used_bytes = 0;
+                $path_to_scan = file_exists('/data') ? '/data' : $base_dir;
+                
+                if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
+                    $du_out = @shell_exec('du -sb ' . escapeshellarg($path_to_scan) . ' 2>/dev/null');
+                    if ($du_out) {
+                        $used_bytes = (float)trim(explode("\t", $du_out)[0]);
+                    }
+                }
+                
+                if ($used_bytes <= 0) {
+                    try {
+                        $iter = new RecursiveIteratorIterator(
+                            new RecursiveDirectoryIterator($path_to_scan, RecursiveDirectoryIterator::SKIP_DOTS),
+                            RecursiveIteratorIterator::LEAVES_ONLY,
+                            RecursiveIteratorIterator::CATCH_GET_CHILD
+                        );
+                        foreach ($iter as $file) {
+                            $used_bytes += $file->getSize();
+                        }
+                    } catch (Exception $e) {}
+                }
+                
+                $used = $used_bytes;
+                $free = ($total > $used) ? ($total - $used) : 0;
+            }
+            
+            echo json_encode([
+                'status' => 'success',
+                'total' => $total,
+                'free' => $free,
+                'used' => $used,
+                'is_cluster' => $is_cluster,
+                'has_custom_limit' => $has_custom_limit
+            ]);
             exit;
         } elseif ($action === 'sysinfo') {
             echo json_encode([
@@ -529,8 +575,8 @@ input,textarea{font-family:inherit}
 .btn-primary:hover{background:var(--acc2);box-shadow:0 0 0 2px var(--acc-glow)}
 .btn-ghost{border-color:var(--border);color:var(--text)}
 .btn-ghost:hover{background:var(--surface2);border-color:var(--border2)}
-.btn-danger{color:var(--red);border-color:var(--border)}
-.btn-danger:hover{background:rgba(192,43,10,0.05);border-color:var(--red)}
+.btn-danger{background:var(--red)!important;color:#fff!important;border-color:var(--red)!important}
+.btn-danger:hover{background:#a02008!important;border-color:#a02008!important;box-shadow:0 0 0 2px rgba(192,43,10,0.12)!important}
 .btn-sm{padding:4px 8px;font-size:12px}
 .btn-icon{padding:6px 9px;gap:0}
 .search-wrap{position:relative;flex:1;max-width:300px}
@@ -771,7 +817,7 @@ input,textarea{font-family:inherit}
       <button class="btn btn-ghost btn-sm btn-icon" onclick="load()"><i class="fa-solid fa-arrows-rotate"></i></button>
       <div class="tool-sep"></div>
       <button class="btn btn-ghost btn-sm" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> Folder</button>
-      <button class="btn btn-ghost btn-sm" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-plus"></i> File</button>
+      <button class="btn btn-ghost btn-sm" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-circle-plus"></i> File</button>
       <div class="tool-sep"></div>
       <button class="btn btn-ghost btn-sm" id="sel-btn" onclick="toggleMultiSelect()"><i class="fa-solid fa-check-double"></i> Multi-Select</button>
       <button class="btn btn-ghost btn-sm" id="sel-all-btn" onclick="selectAll()"><i class="fa-solid fa-square-check"></i> Select All</button>
@@ -1020,10 +1066,23 @@ async function loadDiskUsage() {
     return;
   }
   document.getElementById('disk-card').style.display = '';
-  const pct = Math.round(d.used / d.total * 100);
-  document.getElementById('disk-pct').textContent = pct + '%';
-  document.getElementById('disk-fill').style.width = pct + '%';
-  document.getElementById('disk-detail').textContent = fmtSize(d.used) + ' used of ' + fmtSize(d.total);
+  
+  const pctEl = document.getElementById('disk-pct');
+  const barEl = document.querySelector('.disk-bar');
+  
+  if (d.is_cluster && !d.has_custom_limit) {
+    if (pctEl) pctEl.style.display = 'none';
+    if (barEl) barEl.style.display = 'none';
+    document.getElementById('disk-detail').textContent = fmtSize(d.used) + ' used';
+  } else {
+    if (pctEl) pctEl.style.display = '';
+    if (barEl) barEl.style.display = '';
+    const pct = Math.round(d.used / d.total * 100);
+    if (pctEl) pctEl.textContent = pct + '%';
+    const fillEl = document.getElementById('disk-fill');
+    if (fillEl) fillEl.style.width = pct + '%';
+    document.getElementById('disk-detail').textContent = fmtSize(d.used) + ' used of ' + fmtSize(d.total);
+  }
 }
 
 function getIcon(item) {
@@ -1031,16 +1090,16 @@ function getIcon(item) {
   const ext = (item.ext || '').toLowerCase();
   const map = {
     php:'fa-brands fa-php ic-php', html:'fa-brands fa-html5 ic-html', htm:'fa-brands fa-html5 ic-html',
-    css:'fa-brands fa-css3-alt ic-css', js:'fa-brands fa-js ic-js', json:'fa-solid fa-brackets-curly ic-json',
-    md:'fa-brands fa-markdown ic-md', jpg:'fa-solid fa-image ic-img', jpeg:'fa-solid fa-image ic-img',
-    png:'fa-solid fa-image ic-img', gif:'fa-solid fa-image ic-img', webp:'fa-solid fa-image ic-img',
-    svg:'fa-solid fa-image ic-img', zip:'fa-solid fa-file-zipper ic-zip', tar:'fa-solid fa-file-zipper ic-zip',
-    gz:'fa-solid fa-file-zipper ic-gz', pdf:'fa-solid fa-file-pdf ic-pdf', sql:'fa-solid fa-database ic-sql',
-    txt:'fa-solid fa-file-lines ic-txt', sh:'fa-solid fa-terminal ic-sh', xml:'fa-solid fa-code ic-xml',
-    mp4:'fa-solid fa-film ic-mp4', webm:'fa-solid fa-film ic-mp4', mp3:'fa-solid fa-music ic-mp3',
-    wav:'fa-solid fa-music ic-mp3'
+    css:'fa-brands fa-css3-alt ic-css', js:'fa-brands fa-js ic-js', json:'fa-solid fa-code ic-json',
+    md:'fa-regular fa-file-lines ic-md', jpg:'fa-solid fa-file-image ic-img', jpeg:'fa-solid fa-file-image ic-img',
+    png:'fa-solid fa-file-image ic-img', gif:'fa-solid fa-file-image ic-img', webp:'fa-solid fa-file-image ic-img',
+    svg:'fa-solid fa-file-image ic-img', zip:'fa-solid fa-file-archive ic-zip', tar:'fa-solid fa-file-archive ic-zip',
+    gz:'fa-solid fa-file-archive ic-zip', pdf:'fa-solid fa-file-pdf ic-pdf', sql:'fa-solid fa-database ic-sql',
+    txt:'fa-regular fa-file-alt ic-txt', sh:'fa-solid fa-terminal ic-sh', xml:'fa-solid fa-code ic-xml',
+    mp4:'fa-solid fa-file-video ic-mp4', webm:'fa-solid fa-file-video ic-mp4', mp3:'fa-solid fa-file-audio ic-mp3',
+    wav:'fa-solid fa-file-audio ic-mp3'
   };
-  return `<i class="${map[ext] || 'fa-solid fa-file ic-default'}"></i>`;
+  return `<i class="${map[ext] || 'fa-regular fa-file ic-default'}"></i>`;
 }
 
 function sortItems(items) {
@@ -1388,7 +1447,7 @@ function showCtx(e, item, path) {
     ${!item.is_dir ? `<div class="ctx-item" onclick="downloadFile('${escJs(path)}')"><i class="fa-solid fa-download"></i> Download</div>` : ''}
     
     ${remoteMode ? 
-      `<div class="ctx-item" onclick="transferCross('to_local', '${escJs(path)}')"><i class="fa-solid fa-arrow-down-left-and-arrow-up-right-to-center"></i> Transfer to Local</div>` : 
+      `<div class="ctx-item" onclick="transferCross('to_local', '${escJs(path)}')"><i class="fa-solid fa-cloud-arrow-down"></i> Transfer to Local</div>` : 
       (sftpActive ? `<div class="ctx-item" onclick="transferCross('to_sftp', '${escJs(path)}')"><i class="fa-solid fa-network-wired"></i> Transfer to SFTP</div>` : '')
     }
 
