@@ -1,6 +1,7 @@
 <?php
 session_start();
-$base_dir = realpath('/var/www/localhost/htdocs');
+
+$base_dir = realpath('/var/www/localhost/htdocs') ?: realpath(__DIR__ . '/../../htdocs') ?: __DIR__;
 require_once __DIR__ . '/vendor/autoload.php';
 
 function get_absolute_path($path) {
@@ -72,6 +73,9 @@ function sftp_connect() {
 }
 
 function rrmdir($dir) {
+    if (is_link($dir)) {
+        return unlink($dir);
+    }
     if (is_dir($dir)) {
         $objects = scandir($dir);
         foreach ($objects as $object) {
@@ -121,15 +125,29 @@ if (isset($_GET['api'])) {
         $cwd = $_SESSION['term_cwd'] ?? $base_dir;
         $cmd = trim($req['cmd'] ?? '');
         if (!$cmd) { echo json_encode(['out' => '', 'cwd' => $cwd]); exit; }
-        $escaped_cwd = escapeshellarg($cwd);
-        $full = "cd {$escaped_cwd} 2>/dev/null; {$cmd}; printf '__PWD__%s' \"\$(pwd)\"";
-        $raw = shell_exec($full . ' 2>&1') ?? '';
-        $pos = strrpos($raw, '__PWD__');
-        if ($pos !== false) {
-            $out = substr($raw, 0, $pos);
-            $_SESSION['term_cwd'] = trim(substr($raw, $pos + 7));
+        
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            $escaped_cwd = escapeshellarg($cwd);
+            $full = "cd /d {$escaped_cwd} && {$cmd} && echo __PWD__%CD%";
+            $raw = shell_exec($full . ' 2>&1') ?? '';
+            $pos = strrpos($raw, '__PWD__');
+            if ($pos !== false) {
+                $out = substr($raw, 0, $pos);
+                $_SESSION['term_cwd'] = trim(substr($raw, $pos + 7));
+            } else {
+                $out = $raw;
+            }
         } else {
-            $out = $raw;
+            $escaped_cwd = escapeshellarg($cwd);
+            $full = "cd {$escaped_cwd} 2>/dev/null; {$cmd}; printf '__PWD__%s' \"\$(pwd)\"";
+            $raw = shell_exec($full . ' 2>&1') ?? '';
+            $pos = strrpos($raw, '__PWD__');
+            if ($pos !== false) {
+                $out = substr($raw, 0, $pos);
+                $_SESSION['term_cwd'] = trim(substr($raw, $pos + 7));
+            } else {
+                $out = $raw;
+            }
         }
         echo json_encode(['out' => htmlspecialchars($out), 'cwd' => $_SESSION['term_cwd']]);
         exit;
@@ -193,7 +211,10 @@ if (isset($_GET['api'])) {
                 unlink($tempFile);
             } else {
                 $targetFile = $current_path . '/' . $fileName;
-                rename($tempFile, $targetFile);
+                if (!@rename($tempFile, $targetFile)) {
+                    copy($tempFile, $targetFile);
+                    unlink($tempFile);
+                }
             }
             echo json_encode(['status' => 'success', 'completed' => true]);
         } else {
@@ -431,9 +452,38 @@ if (isset($_GET['api'])) {
             $target = get_absolute_path($req['path']);
             chmod($target, octdec($req['perms']));
         } elseif ($action === 'diskusage') {
-            $total = disk_total_space($current_path);
-            $free  = disk_free_space($current_path);
-            echo json_encode(['status' => 'success', 'total' => $total, 'free' => $free, 'used' => $total - $free]);
+            $total = @disk_total_space($current_path) ?: 0;
+            $free  = @disk_free_space($current_path) ?: 0;
+            
+            if ($total <= 0) {
+                $df_out = @shell_exec('df -P ' . escapeshellarg($current_path));
+                if ($df_out) {
+                    $lines = explode("\n", trim($df_out));
+                    if (count($lines) >= 2) {
+                        $cols = preg_split('/\s+/', $lines[1]);
+                        if (count($cols) >= 4) {
+                            $total = (float)$cols[1] * 1024;
+                            $free  = (float)$cols[3] * 1024;
+                        }
+                    }
+                }
+            }
+            
+            $used = ($total > $free) ? ($total - $free) : 0;
+            echo json_encode(['status' => 'success', 'total' => $total, 'free' => $free, 'used' => $used]);
+            exit;
+        } elseif ($action === 'sysinfo') {
+            echo json_encode([
+                'status' => 'success',
+                'php_version' => PHP_VERSION,
+                'os' => PHP_OS,
+                'upload_max' => ini_get('upload_max_filesize'),
+                'post_max' => ini_get('post_max_size'),
+                'memory_limit' => ini_get('memory_limit'),
+                'max_execution' => ini_get('max_execution_time') . 's',
+                'mysql_status' => extension_loaded('mysqli') ? 'Enabled' : 'Disabled',
+                'zip_status' => class_exists('ZipArchive') ? 'Enabled' : 'Disabled'
+            ]);
             exit;
         }
         echo json_encode(['status' => 'success']);
@@ -448,7 +498,7 @@ if (isset($_GET['api'])) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>File Manager Pro</title>
+<title>File Manager</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@latest/css/all.min.css">
 <style>
 :root {
@@ -535,7 +585,7 @@ input,textarea{font-family:inherit}
 .file-row .fr-name{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-row .fr-size,.file-row .fr-perms,.file-row .fr-mtime,.file-row .fr-type{font-size:11px;color:var(--text2)}
 .list-header{display:grid;grid-template-columns:20px 24px 1fr 90px 90px 100px 80px;align-items:center;gap:8px;padding:5px 10px;font-size:11px;font-weight:600;color:var(--text2);letter-spacing:.05em;text-transform:uppercase;border-bottom:1px solid var(--border);margin-bottom:4px;cursor:default}
-.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js覆{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
+.ic-folder{color:#e68a00}.ic-php{color:#7058c0}.ic-html,.ic-htm{color:#c0600a}.ic-css{color:#007cba}.ic-js{color:#b0a000}.ic-json{color:#1a8a4a}.ic-md{color:#805ac0}.ic-img{color:#c0208a}.ic-zip,.ic-tar,.ic-gz{color:#c05a00}.ic-pdf{color:#c02b0a}.ic-sql{color:#00789a}.ic-txt{color:#5a6a7a}.ic-sh{color:#2a8a3a}.ic-xml{color:#c0600a}.ic-mp4,.ic-webm{color:#805ac0}.ic-mp3,.ic-wav{color:#c0206a}.ic-default{color:#7a8a9a}
 #statusbar{height:var(--status-h);background:var(--surface);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:11px;color:var(--text2);gap:16px}
 .sb-info{display:flex;align-items:center;gap:12px}
 .sb-badge{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:1px 7px;font-size:11px}
@@ -571,7 +621,7 @@ input,textarea{font-family:inherit}
 #terminal-prompt{color:#58a6ff;font-family:'Courier New',monospace;font-size:13px;white-space:nowrap;margin-right:8px}
 #terminal-input{flex:1;background:transparent;border:none;color:#c9d1d9;font-family:'Courier New',monospace;font-size:13px;outline:none}
 #terminal-input::placeholder{color:#484f58}
-#prompt-modal .modal{width:400px}
+#prompt-modal .modal{width:400px;max-width:95vw}
 .form-group{margin-bottom:14px}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:6px;letter-spacing:.05em;text-transform:uppercase}
 .form-input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:var(--radius);padding:8px 12px;outline:none;font-size:14px;transition:var(--trans)}
@@ -585,7 +635,7 @@ input,textarea{font-family:inherit}
 .toast-fill{height:100%;background:linear-gradient(90deg,var(--acc),var(--purple));transition:.3s ease}
 .toast.success .toast-fill{background:var(--green)}
 .toast.error .toast-fill{background:var(--red);width:100%}
-#upload-modal .modal{width:480px}
+#upload-modal .modal{width:480px;max-width:95vw}
 #upload-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed var(--border2);border-radius:var(--radius2);padding:30px;text-align:center;color:var(--text2);cursor:pointer;transition:var(--trans)}
 #upload-drop:hover,#upload-drop.drag{border-color:var(--acc);background:var(--acc-glow);color:var(--acc)}
 #upload-drop i{font-size:40px;margin-bottom:10px}
@@ -602,7 +652,7 @@ input,textarea{font-family:inherit}
 #preview-content{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;background:#fafbfc}
 #preview-content img,#preview-content video,#preview-content audio{max-width:100%;max-height:100%;border-radius:4px}
 #preview-content iframe{width:100%;height:100%;border:none}
-#sftp-modal .modal{width:400px}
+#sftp-modal .modal{width:400px;max-width:95vw}
 @media(max-width:768px){
   #sidebar{display:none;position:fixed;inset:0;width:100%;z-index:100}
   #sidebar.open{display:flex}
@@ -612,9 +662,13 @@ input,textarea{font-family:inherit}
   #statusbar{position:fixed;bottom:0;left:0;right:0;z-index:41}
   #content{padding-bottom:calc(var(--status-h) * 2 + 8px)}
   .file-row{grid-template-columns:20px 24px 1fr 70px}
-  .file-row .fr-size,.file-row .fr-perms,.file-row .fr-type{display:none}
+  .file-row .fr-mtime,.file-row .fr-perms,.file-row .fr-type{display:none}
   .list-header{grid-template-columns:20px 24px 1fr 70px}
-  .list-header span:nth-child(n+5){display:none}
+  .list-header div:nth-child(4),
+  .list-header div:nth-child(6),
+  .list-header div:nth-child(7) {
+    display: none;
+  }
   #editor-modal .modal{width:100vw;height:100vh;border-radius:0}
   #terminal-modal .modal{width:100vw;height:100vh;border-radius:0}
   .sidebar-toggle{display:inline-flex!important}
@@ -639,13 +693,32 @@ input,textarea{font-family:inherit}
   animation: spin 0.6s cubic-bezier(0.4, 0, 0.2, 1);
   display: inline-block;
 }
+.file-card.drag-hover, .file-row.drag-hover {
+  border-color: var(--acc) !important;
+  background: var(--acc-glow) !important;
+  transform: scale(1.02);
+}
+.bc-item.drag-hover {
+  color: var(--acc) !important;
+  background: var(--acc-glow) !important;
+  font-weight: bold;
+}
+@media (max-width: 480px) {
+  .logo {
+    font-size: 0 !important;
+  }
+  .logo i {
+    font-size: 18px !important;
+    margin-right: 0 !important;
+  }
+}
 </style>
 </head>
 <body>
 
 <div id="header">
   <div class="logo">
-    <i class="fa-solid fa-folder-tree"></i> File Manager <span>Pro</span>
+    <i class="fa-solid fa-folder-tree"></i> File Manager
   </div>
   <div class="hdr-tools">
     <div class="search-wrap">
@@ -674,6 +747,7 @@ input,textarea{font-family:inherit}
     <div class="nav-item" onclick="promptAction('mkdir')"><i class="fa-solid fa-folder-plus"></i> New Folder</div>
     <div class="nav-item" onclick="promptAction('mkfile')"><i class="fa-solid fa-file-circle-plus"></i> New File</div>
     <div class="nav-item" onclick="openUpload()"><i class="fa-solid fa-cloud-arrow-up"></i> Upload Files</div>
+    <div class="nav-item" onclick="openSysInfo()"><i class="fa-solid fa-server"></i> Server Info</div>
     <div class="sidebar-section">View</div>
     <div class="nav-item active" id="nav-grid" onclick="setView('grid')"><i class="fa-solid fa-grip"></i> Grid View</div>
     <div class="nav-item" id="nav-list" onclick="setView('list')"><i class="fa-solid fa-list"></i> List View</div>
@@ -755,6 +829,20 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
+<div class="modal-backdrop" id="alert-confirm-modal">
+  <div class="modal" style="width: 400px; max-width: 95vw;">
+    <div class="modal-header">
+      <div class="modal-title" id="ac-title">Notification</div>
+      <button class="close-btn" onclick="closeModal('alert-confirm-modal')"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="modal-body" id="ac-body" style="font-size: 14px; line-height: 1.5; color: var(--text);"></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" id="ac-cancel-btn" onclick="closeModal('alert-confirm-modal')">Cancel</button>
+      <button class="btn btn-primary" id="ac-ok-btn">OK</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="prompt-modal">
   <div class="modal">
     <div class="modal-header"><div class="modal-title" id="prompt-title"></div><button class="close-btn" onclick="closeModal('prompt-modal')"><i class="fa-solid fa-xmark"></i></button></div>
@@ -800,8 +888,21 @@ input,textarea{font-family:inherit}
   </div>
 </div>
 
+<div class="modal-backdrop" id="sysinfo-modal">
+  <div class="modal" style="width: 450px; max-width: 95vw;">
+    <div class="modal-header">
+      <div class="modal-title"><i class="fa-solid fa-server"></i> Server Configuration</div>
+      <button class="close-btn" onclick="closeModal('sysinfo-modal')"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="modal-body" id="sysinfo-body"></div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="closeModal('sysinfo-modal')">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="chmod-modal">
-  <div class="modal" style="width: 420px;">
+  <div class="modal" style="width: 420px; max-width: 95vw;">
     <div class="modal-header">
       <div class="modal-title"><i class="fa-solid fa-shield-halved"></i> File Permissions</div>
       <button class="close-btn" onclick="closeModal('chmod-modal')"><i class="fa-solid fa-xmark"></i></button>
@@ -914,7 +1015,11 @@ async function load(path) {
 
 async function loadDiskUsage() {
   const d = await api('diskusage');
-  if (d.status !== 'success') return;
+  if (d.status !== 'success' || !d.total || d.total <= 0) {
+    document.getElementById('disk-card').style.display = 'none';
+    return;
+  }
+  document.getElementById('disk-card').style.display = '';
   const pct = Math.round(d.used / d.total * 100);
   document.getElementById('disk-pct').textContent = pct + '%';
   document.getElementById('disk-fill').style.width = pct + '%';
@@ -983,6 +1088,18 @@ function render(items) {
       card.onclick = e => handleClick(e, item, fullRelPath, card);
       card.ondblclick = () => handleDblClick(item, fullRelPath);
       card.oncontextmenu = e => showCtx(e, item, fullRelPath);
+      
+      card.draggable = true;
+      card.addEventListener('dragstart', e => handleDragStart(e, fullRelPath));
+      card.addEventListener('dragend', handleDragEnd);
+      
+      if (item.is_dir) {
+        card.addEventListener('dragover', e => handleDragOver(e, card));
+        card.addEventListener('dragenter', e => handleDragEnter(e, card));
+        card.addEventListener('dragleave', e => handleDragLeaveTarget(e, card));
+        card.addEventListener('drop', e => handleDrop(e, fullRelPath, card));
+      }
+      
       list.appendChild(card);
     } else {
       const row = document.createElement('div');
@@ -996,6 +1113,18 @@ function render(items) {
       row.onclick = e => { if (e.target.tagName !== 'INPUT') handleClick(e, item, fullRelPath, row); };
       row.ondblclick = () => handleDblClick(item, fullRelPath);
       row.oncontextmenu = e => showCtx(e, item, fullRelPath);
+      
+      row.draggable = true;
+      row.addEventListener('dragstart', e => handleDragStart(e, fullRelPath));
+      row.addEventListener('dragend', handleDragEnd);
+      
+      if (item.is_dir) {
+        row.addEventListener('dragover', e => handleDragOver(e, row));
+        row.addEventListener('dragenter', e => handleDragEnter(e, row));
+        row.addEventListener('dragleave', e => handleDragLeaveTarget(e, row));
+        row.addEventListener('drop', e => handleDrop(e, fullRelPath, row));
+      }
+      
       list.appendChild(row);
     }
   });
@@ -1142,14 +1271,97 @@ function renderBreadcrumb() {
   const bc = document.getElementById('breadcrumb');
   const base = remoteMode ? remoteCwd : currentPath;
   const parts = base.split('/').filter(p => p);
-  let html = `<i class="fa-solid fa-house" style="color:var(--text2);font-size:12px"></i><span class="bc-sep">›</span><span class="bc-item" onclick="load('')">htdocs</span>`;
+  let html = `<i class="fa-solid fa-house" style="color:var(--text2);font-size:12px"></i><span class="bc-sep">›</span><span class="bc-item" data-path="" onclick="load('')">htdocs</span>`;
   let built = '';
   parts.forEach((p,i) => {
     built += (built ? '/' : '') + p;
-    html += `<span class="bc-sep">›</span><span class="bc-item${i===parts.length-1?' active':''}" onclick="load('${escHtml(built)}')">${escHtml(p)}</span>`;
+    html += `<span class="bc-sep">›</span><span class="bc-item${i===parts.length-1?' active':''}" data-path="${escHtml(built)}" onclick="load('${escHtml(built)}')">${escHtml(p)}</span>`;
   });
   bc.innerHTML = html;
   document.getElementById('sb-path').textContent = '/' + base;
+  
+  bc.querySelectorAll('.bc-item').forEach(item => {
+    item.addEventListener('dragover', e => handleDragOver(e, item));
+    item.addEventListener('dragenter', e => handleDragEnter(e, item));
+    item.addEventListener('dragleave', e => handleDragLeaveTarget(e, item));
+    item.addEventListener('drop', e => handleDrop(e, item.dataset.path, item));
+  });
+}
+
+let draggedPath = null;
+
+function handleDragStart(e, path) {
+  if (!selected.has(path)) {
+    selected.clear();
+    selected.add(path);
+    updateSelectionUI();
+  }
+  draggedPath = path;
+  
+  const paths = Array.from(selected);
+  e.dataTransfer.setData('application/json', JSON.stringify(paths));
+  e.dataTransfer.setData('text/plain', path);
+  e.dataTransfer.effectAllowed = 'move';
+  e.target.style.opacity = '0.5';
+}
+
+function handleDragEnd(e) {
+  e.target.style.opacity = '';
+  draggedPath = null;
+}
+
+function handleDragOver(e, el) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+}
+
+function handleDragEnter(e, el) {
+  e.preventDefault();
+  el.classList.add('drag-hover');
+}
+
+function handleDragLeaveTarget(e, el) {
+  el.classList.remove('drag-hover');
+}
+
+async function handleDrop(e, dstPath, el) {
+  e.preventDefault();
+  el.classList.remove('drag-hover');
+  
+  let paths = [];
+  try {
+    const data = e.dataTransfer.getData('application/json');
+    if (data) {
+      paths = JSON.parse(data);
+    }
+  } catch (err) {}
+  
+  if (!paths || paths.length === 0) {
+    const path = e.dataTransfer.getData('text/plain');
+    if (path) paths = [path];
+  }
+  
+  if (!paths || paths.length === 0) return;
+  
+  const filteredPaths = paths.filter(p => {
+    if (p === dstPath) return false;
+    if (dstPath.startsWith(p + '/')) return false;
+    const parent = p.split('/').slice(0, -1).join('/');
+    if (parent === dstPath) return false;
+    return true;
+  });
+  
+  if (filteredPaths.length === 0) return;
+  
+  showToast('Moving items...', 'info', 1000);
+  const res = await api('move', { paths: filteredPaths, dst: dstPath });
+  if (res.status === 'success') {
+    selected.clear();
+    load();
+    showToast('Items moved successfully', 'success');
+  } else {
+    showToast(res.message || 'Failed to move items', 'error');
+  }
 }
 
 function updateStatusBar() {
@@ -1235,9 +1447,10 @@ function promptConfirm() { window._promptAction && window._promptAction(); }
 
 async function deleteSelected() {
   if (!selected.size) return;
-  if (!confirm(`Delete ${selected.size} item(s)?`)) return;
-  await api('delete', {paths:[...selected]});
-  selected.clear(); load(); showToast('Deleted','success');
+  customConfirm(`Delete ${selected.size} item(s)?`, async () => {
+    await api('delete', {paths:[...selected]});
+    selected.clear(); load(); showToast('Deleted','success');
+  }, 'Confirm Delete', true);
 }
 
 function openRename(path, name) {
@@ -1263,19 +1476,20 @@ async function doRename() {
 
 function openMoveCopyModal(mode) {
   if (!selected.size) return;
-  const dst = prompt(`Destination (relative):`, currentPath);
-  if (!dst) return;
-  api(mode, {paths:[...selected], dst}).then(r => {
-    if (r.status === 'success') { selected.clear(); load(); showToast(mode==='move'?'Moved':'Copied','success'); }
-  });
+  customPrompt('Destination (relative):', currentPath, (dst) => {
+    api(mode, {paths:[...selected], dst}).then(r => {
+      if (r.status === 'success') { selected.clear(); load(); showToast(mode==='move'?'Moved':'Copied','success'); }
+    });
+  }, mode === 'move' ? 'Move Items' : 'Copy Items');
 }
 
-async function zipSelected() {
+function zipSelected() {
   if (!selected.size) return;
-  const name = prompt('ZIP file name:', [...selected][0].split('/').pop() + '.zip');
-  if (!name) return;
-  await api('zip', {paths:[...selected], name});
-  load(); showToast('ZIP created','success');
+  const defName = [...selected][0].split('/').pop() + '.zip';
+  customPrompt('ZIP file name:', defName, async (name) => {
+    await api('zip', {paths:[...selected], name});
+    load(); showToast('ZIP created','success');
+  }, 'Compress Items');
 }
 
 async function doUnzip(path) {
@@ -1336,6 +1550,21 @@ function updateEditorLineNumbers() {
 
 document.getElementById('code-editor').addEventListener('scroll', function() {
   document.getElementById('line-numbers').scrollTop = this.scrollTop;
+});
+
+document.getElementById('code-editor').addEventListener('keydown', function(e) {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const start = this.selectionStart;
+    const end = this.selectionEnd;
+    this.value = this.value.substring(0, start) + "    " + this.value.substring(end);
+    this.selectionStart = this.selectionEnd = start + 4;
+    editorChanged();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    saveFile();
+  }
 });
 
 async function openEditor(path, name) {
@@ -1541,6 +1770,43 @@ function openModal(id) { document.getElementById(id).classList.add('open'); }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 function closeAllModals() { document.querySelectorAll('.modal-backdrop.open').forEach(m => m.classList.remove('open')); }
 
+function customAlert(message, title = 'Notification') {
+  document.getElementById('ac-title').innerHTML = `<i class="fa-solid fa-circle-info" style="color:var(--acc)"></i> ` + title;
+  document.getElementById('ac-body').textContent = message;
+  document.getElementById('ac-cancel-btn').style.display = 'none';
+  const okBtn = document.getElementById('ac-ok-btn');
+  okBtn.className = 'btn btn-primary';
+  okBtn.onclick = () => closeModal('alert-confirm-modal');
+  openModal('alert-confirm-modal');
+}
+
+function customConfirm(message, onConfirm, title = 'Confirm Action', isDanger = false) {
+  document.getElementById('ac-title').innerHTML = `<i class="fa-solid fa-circle-question" style="color:${isDanger?'var(--red)':'var(--acc)'}"></i> ` + title;
+  document.getElementById('ac-body').textContent = message;
+  document.getElementById('ac-cancel-btn').style.display = '';
+  const okBtn = document.getElementById('ac-ok-btn');
+  okBtn.className = isDanger ? 'btn btn-primary btn-danger' : 'btn btn-primary';
+  okBtn.onclick = () => {
+    closeModal('alert-confirm-modal');
+    onConfirm();
+  };
+  openModal('alert-confirm-modal');
+}
+
+function customPrompt(message, defaultValue, onConfirm, title = 'Input Required') {
+  document.getElementById('prompt-title').textContent = title;
+  const inp = document.getElementById('prompt-input');
+  inp.value = defaultValue;
+  inp.placeholder = message;
+  window._promptAction = () => {
+    const val = inp.value.trim();
+    closeModal('prompt-modal');
+    if (val) onConfirm(val);
+  };
+  openModal('prompt-modal');
+  setTimeout(() => inp.focus(), 100);
+}
+
 document.querySelectorAll('.modal-backdrop').forEach(b => {
   b.addEventListener('click', e => { if (e.target === b) b.classList.remove('open'); });
 });
@@ -1566,6 +1832,41 @@ function showToast(msg, type='info', duration=3000) {
 
 function removeToast(id) { const el = document.getElementById('toast-'+id); if (el) { el.style.opacity='0'; el.style.transform='translateX(20px)'; el.style.transition='.2s'; setTimeout(()=>el.remove(),200); } }
 function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
+
+async function openSysInfo() {
+  const res = await api('sysinfo');
+  if (res.status !== 'success') return;
+  const body = document.getElementById('sysinfo-body');
+  body.innerHTML = `
+    <div style="display: flex; flex-direction: column; gap: 12px;">
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>PHP Version:</strong> <span>${res.php_version}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>Operating System:</strong> <span>${res.os}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>Max Upload Limit:</strong> <span>${res.upload_max}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>Post Max Size:</strong> <span>${res.post_max}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>Memory Limit:</strong> <span>${res.memory_limit}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>Max Execution Time:</strong> <span>${res.max_execution}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 6px;">
+        <strong>MySQL Extension:</strong> <span style="color: ${res.mysql_status === 'Enabled' ? 'var(--green)' : 'var(--red)'}; font-weight: bold;">${res.mysql_status}</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; padding-bottom: 6px;">
+        <strong>ZipArchive Extension:</strong> <span style="color: ${res.zip_status === 'Enabled' ? 'var(--green)' : 'var(--red)'}; font-weight: bold;">${res.zip_status}</span>
+      </div>
+    </div>
+  `;
+  openModal('sysinfo-modal');
+}
 
 function openTerminal() {
   openModal('terminal-modal');
@@ -1615,7 +1916,7 @@ async function sftpConnect() {
     document.getElementById('nav-local').classList.remove('active');
     document.getElementById('sftp-label').textContent = host;
     load();
-  } else alert('SFTP connection failed: ' + (res.message || ''));
+  } else customAlert('SFTP connection failed: ' + (res.message || ''), 'Error');
 }
 
 function loadLocalRoot() {
