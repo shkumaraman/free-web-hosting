@@ -1,7 +1,7 @@
 <?php
 session_start();
 
-$base_dir = realpath('/var/www/localhost/htdocs') ?: realpath(__DIR__ . '/../../htdocs') ?: __DIR__;
+$base_dir = file_exists('/data/htdocs') ? '/data/htdocs' : __DIR__;
 require_once __DIR__ . '/vendor/autoload.php';
 
 function get_absolute_path($path) {
@@ -469,53 +469,18 @@ if (isset($_GET['api'])) {
                 }
             }
             
-            $used = ($total > $free) ? ($total - $free) : 0;
-            
             $custom_limit_gb = getenv('TOTAL_DISK_GB');
-            $has_custom_limit = $custom_limit_gb !== false;
-            
             $is_hf = getenv('SPACE_ID') !== false || file_exists('/data');
-            $is_cluster = $total > 1024 * 1024 * 1024 * 1024 || $is_hf;
             
-            if ($is_cluster || $has_custom_limit) {
-                if ($has_custom_limit) {
-                    $total = (float)$custom_limit_gb * 1024 * 1024 * 1024;
-                }
-                
-                $used_bytes = 0;
-                $path_to_scan = file_exists('/data') ? '/data' : $base_dir;
-                
-                if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
-                    $du_out = @shell_exec('du -sb ' . escapeshellarg($path_to_scan) . ' 2>/dev/null');
-                    if ($du_out) {
-                        $used_bytes = (float)trim(explode("\t", $du_out)[0]);
-                    }
-                }
-                
-                if ($used_bytes <= 0) {
-                    try {
-                        $iter = new RecursiveIteratorIterator(
-                            new RecursiveDirectoryIterator($path_to_scan, RecursiveDirectoryIterator::SKIP_DOTS),
-                            RecursiveIteratorIterator::LEAVES_ONLY,
-                            RecursiveIteratorIterator::CATCH_GET_CHILD
-                        );
-                        foreach ($iter as $file) {
-                            $used_bytes += $file->getSize();
-                        }
-                    } catch (Exception $e) {}
-                }
-                
-                $used = $used_bytes;
-                $free = ($total > $used) ? ($total - $used) : 0;
+            if ($custom_limit_gb !== false) {
+                $total = (float)$custom_limit_gb * 1024 * 1024 * 1024;
+            } elseif ($total > 1024 * 1024 * 1024 * 1024 || $is_hf) {
+                $total = 20 * 1024 * 1024 * 1024;
             }
             
             echo json_encode([
                 'status' => 'success',
-                'total' => $total,
-                'free' => $free,
-                'used' => $used,
-                'is_cluster' => $is_cluster,
-                'has_custom_limit' => $has_custom_limit
+                'total' => $total
             ]);
             exit;
         } elseif ($action === 'sysinfo') {
@@ -805,9 +770,8 @@ input,textarea{font-family:inherit}
 
     <div style="flex:1"></div>
     <div class="disk-card" id="disk-card">
-      <div class="disk-label"><span><i class="fa-solid fa-hard-drive"></i> Disk Usage</span><span id="disk-pct">–</span></div>
-      <div class="disk-bar"><div class="disk-fill" id="disk-fill" style="width:0%"></div></div>
-      <div style="font-size:10px;color:var(--text2);margin-top:5px" id="disk-detail">Loading…</div>
+      <div class="disk-label"><span><i class="fa-solid fa-hard-drive"></i> Disk Space</span></div>
+      <div style="font-size:13px;font-weight:600;color:var(--text);margin-top:5px" id="disk-detail">Loading…</div>
     </div>
   </div>
 
@@ -1066,23 +1030,7 @@ async function loadDiskUsage() {
     return;
   }
   document.getElementById('disk-card').style.display = '';
-  
-  const pctEl = document.getElementById('disk-pct');
-  const barEl = document.querySelector('.disk-bar');
-  
-  if (d.is_cluster && !d.has_custom_limit) {
-    if (pctEl) pctEl.style.display = 'none';
-    if (barEl) barEl.style.display = 'none';
-    document.getElementById('disk-detail').textContent = fmtSize(d.used) + ' used';
-  } else {
-    if (pctEl) pctEl.style.display = '';
-    if (barEl) barEl.style.display = '';
-    const pct = Math.round(d.used / d.total * 100);
-    if (pctEl) pctEl.textContent = pct + '%';
-    const fillEl = document.getElementById('disk-fill');
-    if (fillEl) fillEl.style.width = pct + '%';
-    document.getElementById('disk-detail').textContent = fmtSize(d.used) + ' used of ' + fmtSize(d.total);
-  }
+  document.getElementById('disk-detail').textContent = fmtSize(d.total);
 }
 
 function getIcon(item) {
