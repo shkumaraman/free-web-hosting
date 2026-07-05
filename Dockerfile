@@ -43,39 +43,46 @@ KeepAlive On
 MaxKeepAliveRequests 100
 KeepAliveTimeout 2
 ProxyTimeout 300
+
 <IfModule mpm_event_module>
-    StartServers 1
-    MinSpareThreads 25
-    MaxSpareThreads 75
-    ThreadsPerChild 25
-    MaxRequestWorkers 100
+    StartServers             1
+    MinSpareThreads         25
+    MaxSpareThreads         75
+    ThreadsPerChild         25
+    MaxRequestWorkers      100
     MaxConnectionsPerChild 1000
 </IfModule>
+
 <FilesMatch \.php$>
     SetHandler "proxy:fcgi://127.0.0.1:9000/"
 </FilesMatch>
+
 <Directory /usr/share/webapps/phpmyadmin>
     Options FollowSymLinks
     AllowOverride All
     Require all granted
 </Directory>
+
 <Directory /usr/share/webapps/filemanager>
     Options FollowSymLinks
     AllowOverride All
     Require all granted
 </Directory>
+
 <Directory /var/www/localhost/htdocs>
     Options Indexes FollowSymLinks
     IndexOptions FancyIndexing HTMLTable FoldersFirst IconsAreLinks NameWidth=* DescriptionWidth=* VersionSort Charset=UTF-8
     AllowOverride All
     Require all granted
 </Directory>
+
 <Directory /data/htdocs>
     Options Indexes FollowSymLinks
     IndexOptions FancyIndexing HTMLTable FoldersFirst IconsAreLinks NameWidth=* DescriptionWidth=* VersionSort Charset=UTF-8
     AllowOverride All
     Require all granted
 </Directory>
+
 DirectoryIndex index.php index.html
 EOF
 
@@ -202,17 +209,18 @@ USER appuser
 RUN cd /usr/share/webapps/filemanager && \
     composer require phpseclib/phpseclib && \
     composer clear-cache
-USER root
 
+USER root
 RUN cat << 'EOF' > /start.sh
 #!/bin/sh
+
 MYSQL_PID=""
 FPM_PID=""
 HTTPD_PID=""
 REDIS_PID=""
 BACKUP_PID=""
-
 DATA_OK=1
+
 if ! ls -d /data >/dev/null 2>&1; then
     echo ">>> WARNING: /data mount is unhealthy (Socket not connected or not mounted)!"
     echo ">>> Falling back to ephemeral storage in /tmp..."
@@ -229,7 +237,7 @@ stop_all() {
     CODE="${1:-0}"
     [ -n "$HTTPD_PID" ] && kill "$HTTPD_PID" 2>/dev/null || true
     [ -n "$FPM_PID" ] && kill "$FPM_PID" 2>/dev/null || true
-    
+
     if [ -n "$MYSQL_PID" ] && kill -0 "$MYSQL_PID" 2>/dev/null; then
         echo ">>> Stopping MariaDB cleanly..."
         mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"$(cat "$DATA_DIR/config/root_pass.txt" 2>/dev/null)" shutdown 2>/dev/null || \
@@ -253,9 +261,10 @@ stop_all() {
             echo ">>> Database synced successfully."
         fi
     fi
-    
+
     [ -n "$REDIS_PID" ] && kill "$REDIS_PID" 2>/dev/null || true
     [ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null || true
+
     wait 2>/dev/null || true
     exit "$CODE"
 }
@@ -264,6 +273,7 @@ trap 'stop_all 0' INT TERM
 mkdir -p /run/mysqld /run/php-fpm /run/apache2 /tmp/sessions
 chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp /tmp/sessions 2>/dev/null || true
 chmod 700 /tmp/sessions 2>/dev/null || true
+
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid 2>/dev/null || true
 
 if [ "$DATA_OK" -eq 0 ]; then
@@ -272,6 +282,7 @@ if [ "$DATA_OK" -eq 0 ]; then
 fi
 
 rm -f "$DATA_DIR/mysql/tc.log" "$DATA_DIR/mysql/aria_log_control" 2>/dev/null || true
+
 mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups"
 chown -R appuser:appgroup "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups" 2>/dev/null || true
 chmod 700 "$DATA_DIR/sessions" 2>/dev/null || true
@@ -299,11 +310,10 @@ if [ ! -f "$DATA_DIR/config/pma_secret.php" ]; then
     BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
     echo "<?php \$cfg['blowfish_secret'] = '${BLOWFISH}';" > "$DATA_DIR/config/pma_secret.php"
 fi
-
 sed -i "s|/data/config/pma_secret.php|$DATA_DIR/config/pma_secret.php|g" /etc/phpmyadmin/config.inc.php 2>/dev/null || true
 
 if [ ! -f "$DATA_DIR/config/mariadb.cnf" ]; then
-    cat << 'DBEOF' > "$DATA_DIR/config/mariadb.cnf"
+cat << 'DBEOF' > "$DATA_DIR/config/mariadb.cnf"
 [mariadb]
 max_connections=50
 thread_cache_size=16
@@ -318,7 +328,6 @@ innodb_flush_method=fsync
 skip-name-resolve
 DBEOF
 fi
-
 ln -sfn "$DATA_DIR/config/mariadb.cnf" /etc/my.cnf.d/hf.cnf 2>/dev/null || true
 
 if [ ! -L /var/www/localhost/htdocs ]; then
@@ -326,7 +335,6 @@ if [ ! -L /var/www/localhost/htdocs ]; then
     rm -rf /var/www/localhost/htdocs 2>/dev/null || true
     ln -sfn "$DATA_DIR/htdocs" /var/www/localhost/htdocs
 fi
-
 if [ -f /var/www/localhost/htdocs/.env ]; then
     set -a
     . /var/www/localhost/htdocs/.env || true
@@ -355,9 +363,7 @@ wait_mariadb_ready() {
     local MAX_TRIES="$1"
     local N=0
     while true; do
-        if ! kill -0 "$MYSQL_PID" 2>/dev/null; then
-            return 1
-        fi
+        if ! kill -0 "$MYSQL_PID" 2>/dev/null; then return 1; fi
         if mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root 2>/dev/null || \
            mariadb-admin ping --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" 2>/dev/null; then
             return 0
@@ -403,8 +409,10 @@ if ! wait_mariadb_ready 60; then
             echo ">>> Started under innodb_force_recovery=${LEVEL}. Dumping data before rebuild..."
             DUMP_DIR="$DATA_DIR/backups/recovery_dump_$(date +%s)"
             mkdir -p "$DUMP_DIR"
-            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || \
-            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "${DUMP_DIR}/dump.sql" 2>/dev/null || true
+            
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root "${MYSQL_DATABASE}" > "${DUMP_DIR}/dump.sql" 2>/dev/null || \
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" "${MYSQL_DATABASE}" > "${DUMP_DIR}/dump.sql" 2>/dev/null || true
+            
             mariadb-admin --socket=/run/mysqld/mysqld.sock -u root shutdown 2>/dev/null || \
             mariadb-admin --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" shutdown 2>/dev/null || \
             kill -TERM "$MYSQL_PID" 2>/dev/null || true
@@ -505,13 +513,13 @@ echo ">>> Server is fully ready! Starting backup loop..."
         sleep 3600
         TS=$(date +%Y%m%d_%H%M%S)
         if [ "$DATA_OK" -eq 1 ]; then
-            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "/data/backups/db_${TS}.sql" 2>/dev/null || true
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" "${MYSQL_DATABASE}" > "/data/backups/db_${TS}.sql" 2>/dev/null || true
             tar -czf "/data/backups/files_${TS}.tar.gz" -C /data/htdocs . 2>/dev/null || true
             find /data/backups -maxdepth 1 -type f -mtime +7 -delete 2>/dev/null || true
             find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
             find /data/backups -maxdepth 1 -type d -name 'recovery_dump_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
         else
-            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" --all-databases > "$DATA_DIR/backups/db_${TS}.sql" 2>/dev/null || true
+            mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" "${MYSQL_DATABASE}" > "$DATA_DIR/backups/db_${TS}.sql" 2>/dev/null || true
         fi
     done
 ) &
