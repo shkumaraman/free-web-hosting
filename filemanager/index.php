@@ -112,6 +112,27 @@ function rcopy($src, $dst) {
     }
 }
 
+function get_dir_size($path) {
+    $size = 0;
+    if (is_dir($path)) {
+        $dir = opendir($path);
+        if ($dir) {
+            while (($file = readdir($dir)) !== false) {
+                if ($file !== '.' && $file !== '..') {
+                    $full = $path . '/' . $file;
+                    if (is_dir($full)) {
+                        $size += get_dir_size($full);
+                    } else {
+                        $size += filesize($full);
+                    }
+                }
+            }
+            closedir($dir);
+        }
+    }
+    return $size;
+}
+
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
     $action = $_GET['api'];
@@ -362,7 +383,8 @@ if (isset($_GET['api'])) {
                 if ($a['is_dir'] === $b['is_dir']) return strcasecmp($a['name'], $b['name']);
                 return $a['is_dir'] ? -1 : 1;
             });
-            echo json_encode(['status' => 'success', 'path' => get_relative_path($current_path), 'items' => $items]);
+            $total_used = get_dir_size($base_dir);
+            echo json_encode(['status' => 'success', 'path' => get_relative_path($current_path), 'items' => $items, 'used_size' => $total_used]);
             exit;
         }
 
@@ -669,16 +691,7 @@ input,textarea{font-family:inherit}
   animation: spin 0.6s cubic-bezier(0.4, 0, 0.2, 1);
   display: inline-block;
 }
-.file-card.drag-hover, .file-row.drag-hover {
-  border-color: var(--acc) !important;
-  background: var(--acc-glow) !important;
-  transform: scale(1.02);
-}
-.bc-item.drag-hover {
-  color: var(--acc) !important;
-  background: var(--acc-glow) !important;
-  font-weight: bold;
-}
+
 @media (max-width: 480px) {
   .logo {
     font-size: 0 !important;
@@ -732,6 +745,12 @@ input,textarea{font-family:inherit}
     <a href="https://github.com/shkumaraman/free-web-hosting" target="_blank" class="nav-item" style="text-decoration:none; color:var(--purple); font-weight:600;">
       <i class="fa-brands fa-github" style="color:var(--purple);"></i> SHKUMARAMAN
     </a>
+    
+    <div class="sidebar-section">Storage</div>
+    <div class="nav-item" id="disk-card" style="cursor:default; display:flex; justify-content:space-between; align-items:center;">
+      <span><i class="fa-solid fa-database"></i> Storage Usage</span>
+      <span id="disk-usage">00 MB</span>
+    </div>
 
   </div>
 
@@ -962,12 +981,14 @@ async function load(path) {
   }
 
   if (remoteMode) {
+    document.getElementById('disk-card').style.display = 'none';
     if (path !== undefined) remoteCwd = path;
     const res = await api('list');
     if (res.status !== 'success') return;
     remoteCwd = res.path;
     currentItems = res.items;
   } else {
+    document.getElementById('disk-card').style.display = '';
     if (path !== undefined) currentPath = path;
     selected.clear();
     updateSelectionUI();
@@ -975,6 +996,9 @@ async function load(path) {
     if (res.status !== 'success') return;
     currentPath = res.path;
     currentItems = res.items;
+    if (res.used_size !== undefined) {
+      document.getElementById('disk-usage').textContent = fmtSize(res.used_size);
+    }
   }
   renderBreadcrumb();
   render();
@@ -1043,17 +1067,7 @@ function render(items) {
       card.onclick = e => handleClick(e, item, fullRelPath, card);
       card.ondblclick = () => handleDblClick(item, fullRelPath);
       card.oncontextmenu = e => showCtx(e, item, fullRelPath);
-      
-      card.draggable = true;
-      card.addEventListener('dragstart', e => handleDragStart(e, fullRelPath));
-      card.addEventListener('dragend', handleDragEnd);
-      
-      if (item.is_dir) {
-        card.addEventListener('dragover', e => handleDragOver(e, card));
-        card.addEventListener('dragenter', e => handleDragEnter(e, card));
-        card.addEventListener('dragleave', e => handleDragLeaveTarget(e, card));
-        card.addEventListener('drop', e => handleDrop(e, fullRelPath, card));
-      }
+      bindTouchMenu(card, item, fullRelPath);
       
       list.appendChild(card);
     } else {
@@ -1068,17 +1082,7 @@ function render(items) {
       row.onclick = e => { if (e.target.tagName !== 'INPUT') handleClick(e, item, fullRelPath, row); };
       row.ondblclick = () => handleDblClick(item, fullRelPath);
       row.oncontextmenu = e => showCtx(e, item, fullRelPath);
-      
-      row.draggable = true;
-      row.addEventListener('dragstart', e => handleDragStart(e, fullRelPath));
-      row.addEventListener('dragend', handleDragEnd);
-      
-      if (item.is_dir) {
-        row.addEventListener('dragover', e => handleDragOver(e, row));
-        row.addEventListener('dragenter', e => handleDragEnter(e, row));
-        row.addEventListener('dragleave', e => handleDragLeaveTarget(e, row));
-        row.addEventListener('drop', e => handleDrop(e, fullRelPath, row));
-      }
+      bindTouchMenu(row, item, fullRelPath);
       
       list.appendChild(row);
     }
@@ -1235,88 +1239,48 @@ function renderBreadcrumb() {
   bc.innerHTML = html;
   document.getElementById('sb-path').textContent = '/' + base;
   
-  bc.querySelectorAll('.bc-item').forEach(item => {
-    item.addEventListener('dragover', e => handleDragOver(e, item));
-    item.addEventListener('dragenter', e => handleDragEnter(e, item));
-    item.addEventListener('dragleave', e => handleDragLeaveTarget(e, item));
-    item.addEventListener('drop', e => handleDrop(e, item.dataset.path, item));
+
+}
+
+function bindTouchMenu(el, item, path) {
+  let touchTimer = null;
+  let preventClick = false;
+  el.addEventListener('touchstart', e => {
+    preventClick = false;
+    if (e.touches.length > 1) return;
+    touchTimer = setTimeout(() => {
+      preventClick = true;
+      const touch = e.touches[0];
+      const mockEvent = {
+        preventDefault: () => e.preventDefault(),
+        stopPropagation: () => e.stopPropagation(),
+        clientX: touch.clientX,
+        clientY: touch.clientY
+      };
+      showCtx(mockEvent, item, path);
+    }, 600);
   });
-}
-
-let draggedPath = null;
-
-function handleDragStart(e, path) {
-  if (!selected.has(path)) {
-    selected.clear();
-    selected.add(path);
-    updateSelectionUI();
-  }
-  draggedPath = path;
-  
-  const paths = Array.from(selected);
-  e.dataTransfer.setData('application/json', JSON.stringify(paths));
-  e.dataTransfer.setData('text/plain', path);
-  e.dataTransfer.effectAllowed = 'move';
-  e.target.style.opacity = '0.5';
-}
-
-function handleDragEnd(e) {
-  e.target.style.opacity = '';
-  draggedPath = null;
-}
-
-function handleDragOver(e, el) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
-}
-
-function handleDragEnter(e, el) {
-  e.preventDefault();
-  el.classList.add('drag-hover');
-}
-
-function handleDragLeaveTarget(e, el) {
-  el.classList.remove('drag-hover');
-}
-
-async function handleDrop(e, dstPath, el) {
-  e.preventDefault();
-  el.classList.remove('drag-hover');
-  
-  let paths = [];
-  try {
-    const data = e.dataTransfer.getData('application/json');
-    if (data) {
-      paths = JSON.parse(data);
+  el.addEventListener('touchmove', () => {
+    if (touchTimer) {
+      clearTimeout(touchTimer);
+      touchTimer = null;
     }
-  } catch (err) {}
-  
-  if (!paths || paths.length === 0) {
-    const path = e.dataTransfer.getData('text/plain');
-    if (path) paths = [path];
-  }
-  
-  if (!paths || paths.length === 0) return;
-  
-  const filteredPaths = paths.filter(p => {
-    if (p === dstPath) return false;
-    if (dstPath.startsWith(p + '/')) return false;
-    const parent = p.split('/').slice(0, -1).join('/');
-    if (parent === dstPath) return false;
-    return true;
   });
-  
-  if (filteredPaths.length === 0) return;
-  
-  showToast('Moving items...', 'info', 1000);
-  const res = await api('move', { paths: filteredPaths, dst: dstPath });
-  if (res.status === 'success') {
-    selected.clear();
-    load();
-    showToast('Items moved successfully', 'success');
-  } else {
-    showToast(res.message || 'Failed to move items', 'error');
-  }
+  el.addEventListener('touchend', e => {
+    if (touchTimer) {
+      clearTimeout(touchTimer);
+      touchTimer = null;
+    }
+    if (preventClick) {
+      e.preventDefault();
+    }
+  });
+  el.addEventListener('touchcancel', () => {
+    if (touchTimer) {
+      clearTimeout(touchTimer);
+      touchTimer = null;
+    }
+  });
 }
 
 function updateStatusBar() {
