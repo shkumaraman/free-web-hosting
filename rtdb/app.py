@@ -5,170 +5,88 @@ import json
 import os
 import random
 import re
-import shutil
 import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
+import requests
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
 HF_TOKEN = os.getenv("HF_TOKEN", "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")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE_DIR = os.getenv("STORAGE_DIR", os.path.join(BASE_DIR, "storage"))
-RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
-DB_FILE = os.path.join(STORAGE_DIR, "db.json")
-METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
-BACKUPS_DIR = os.path.join(STORAGE_DIR, "backups")
-UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
+HF_BUCKET_URL = f"https://huggingface.co/api/buckets/{BUCKET_NAME}/raw"
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
 
-os.makedirs(STORAGE_DIR, exist_ok=True)
-os.makedirs(BACKUPS_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-
-HF_SYNC_LOCK = asyncio.Lock()
-HF_DIRTY = False
-
-def get_hf_cmd() -> str:
-    if shutil.which("hf"):
-        return "hf"
-    local_hf = os.path.expanduser("~/.local/bin/hf")
-    if os.path.isfile(local_hf):
-        return local_hf
-    if os.path.isfile("/usr/local/bin/hf"):
-        return "/usr/local/bin/hf"
-    return "hf"
-
-async def run_hf_sync(direction: str):
+def hf_bucket_get(remote_path: str) -> Optional[bytes]:
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
-        return
-    env = os.environ.copy()
-    env["HF_TOKEN"] = HF_TOKEN
-    hf_bin = get_hf_cmd()
-
-    if direction == "pull":
-        cmd = [hf_bin, "sync", f"hf://buckets/{BUCKET_NAME}", STORAGE_DIR]
-    else:
-        cmd = [hf_bin, "sync", STORAGE_DIR, f"hf://buckets/{BUCKET_NAME}"]
-
+        return None
+    url = f"{HF_BUCKET_URL}/{remote_path.lstrip('/')}"
     try:
-        async with HF_SYNC_LOCK:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                print(f"HF Sync ({direction}) success")
-            else:
-                print(f"HF Sync ({direction}) info: {stderr.decode().strip()}")
+        r = requests.get(url, headers=HF_HEADERS, timeout=20)
+        if r.status_code == 200:
+            return r.content
+        return None
     except Exception as e:
-        print(f"HF Sync execution skipped/error: {e}")
+        print(f"HF Bucket GET error ({remote_path}): {e}")
+        return None
 
-async def hf_sync_worker():
-    global HF_DIRTY
-    while True:
-        await asyncio.sleep(30)
-        if HF_DIRTY:
-            await run_hf_sync("push")
-            HF_DIRTY = False
+def hf_bucket_put(remote_path: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+    if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        return False
+    url = f"{HF_BUCKET_URL}/{remote_path.lstrip('/')}"
+    headers = {**HF_HEADERS, "Content-Type": content_type}
+    try:
+        r = requests.put(url, headers=headers, data=data, timeout=60)
+        if r.status_code in [200, 201, 204]:
+            return True
+        print(f"HF Bucket PUT failed ({remote_path}): {r.status_code} - {r.text}")
+        return False
+    except Exception as e:
+        print(f"HF Bucket PUT error ({remote_path}): {e}")
+        return False
 
-def check_nsfw_image(file_path: str) -> bool:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
+def hf_bucket_delete(remote_path: str) -> bool:
+    if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        return False
+    url = f"{HF_BUCKET_URL}/{remote_path.lstrip('/')}"
+    try:
+        r = requests.delete(url, headers=HF_HEADERS, timeout=20)
+        return r.status_code in [200, 204]
+    except Exception as e:
+        print(f"HF Bucket DELETE error ({remote_path}): {e}")
+        return False
+
+def check_nsfw_image_bytes(data: bytes, ext: str) -> bool:
+    if ext.lower() not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
         return False
     try:
+        import io
+        from PIL import Image
         import opennsfw2 as n2
-        nsfw_prob = n2.predict_image(file_path)
-        if nsfw_prob >= 0.75:
-            return True
+        img = Image.open(io.BytesIO(data))
+        prob = n2.predict_image(img)
+        return prob >= 0.75
     except Exception:
         return False
-    return False
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await run_hf_sync("pull")
-    load_rules()
-    load_database()
-    load_metrics()
-    
-    flusher_task = asyncio.create_task(metrics_flusher())
-    hf_task = asyncio.create_task(hf_sync_worker())
-    try:
-        yield
-    finally:
-        flusher_task.cancel()
-        hf_task.cancel()
-        if METRICS_DIRTY:
-            await asyncio.to_thread(save_metrics)
-        if HF_DIRTY:
-            await run_hf_sync("push")
-
-app = FastAPI(title="Realtime Database", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 DATABASE: Dict[str, Any] = {}
 RULES: Dict[str, Any] = {"rules": {".read": True, ".write": True}}
 METRICS: Dict[str, Any] = {"days": {}, "hours": {}}
-db_lock = asyncio.Lock()
+BACKUPS_METADATA: List[Dict[str, Any]] = []
 
+db_lock = asyncio.Lock()
 subscriptions: Dict[str, List[WebSocket]] = {}
 active_websockets = set()
 STORAGE_BYTES = 0
 METRICS_DIRTY = False
-
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
-
-def strip_json_suffix(path: str) -> str:
-    if path.endswith(".json"):
-        return path[:-5]
-    return path
-
-def _atomic_write_text(path: str, text: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp-{os.getpid()}-{random.randint(0, 999999)}"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-        except Exception:
-            pass
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-def _safe_backup_path(filename: str) -> str:
-    clean_name = os.path.basename(filename)
-    full_path = os.path.normpath(os.path.join(BACKUPS_DIR, clean_name))
-    backups_abs = os.path.abspath(BACKUPS_DIR)
-    if full_path != backups_abs and not full_path.startswith(backups_abs + os.sep):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
-    return full_path
 
 def generate_push_id() -> str:
     now_ms = int(time.time() * 1000)
@@ -197,17 +115,9 @@ class RuleDataSnapshot:
             else:
                 return RuleDataSnapshot(None)
         return RuleDataSnapshot(curr)
-    def hasChild(self, path: str) -> bool:
-        return self.child(path).exists()
-    def isString(self) -> bool:
-        return isinstance(self._value, str)
-    def isNumber(self) -> bool:
-        return isinstance(self._value, (int, float)) and not isinstance(self._value, bool)
-    def isBoolean(self) -> bool:
-        return isinstance(self._value, bool)
 
 class SafeRuleEval(EvalWithCompoundTypes):
-    ALLOWED_METHODS = {"val", "child", "exists", "hasChild", "isString", "isNumber", "isBoolean"}
+    ALLOWED_METHODS = {"val", "child", "exists"}
     def _eval_call(self, node):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr in self.ALLOWED_METHODS:
@@ -221,355 +131,165 @@ class SafeRuleEval(EvalWithCompoundTypes):
 
 def load_rules():
     global RULES
-    if os.path.exists(RULES_FILE):
+    raw = hf_bucket_get("rules.json")
+    if raw:
         try:
-            with open(RULES_FILE, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict) and "rules" in parsed:
-                        RULES = parsed
-                        return
+            RULES = json.loads(raw.decode("utf-8"))
+            return
         except Exception:
             pass
     RULES = {"rules": {".read": True, ".write": True}}
-    _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
+    hf_bucket_put("rules.json", json.dumps(RULES, indent=2).encode("utf-8"), "application/json")
 
 def load_database():
-    if os.path.exists(DB_FILE):
+    global DATABASE, STORAGE_BYTES
+    raw = hf_bucket_get("db.json")
+    if raw:
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    DATABASE.clear()
-                    DATABASE.update(json.loads(content))
-        except Exception:
+            text = raw.decode("utf-8")
             DATABASE.clear()
+            DATABASE.update(json.loads(text))
+            STORAGE_BYTES = len(raw)
+            return
+        except Exception:
+            pass
+    DATABASE.clear()
+    STORAGE_BYTES = 0
 
 def load_metrics():
     global METRICS
-    if os.path.exists(METRICS_FILE):
+    raw = hf_bucket_get("metrics.json")
+    if raw:
         try:
-            with open(METRICS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    if "days" in raw and "hours" in raw:
-                        METRICS = raw
-                    else:
-                        METRICS = {"days": raw, "hours": {}}
-                return
+            METRICS = json.loads(raw.decode("utf-8"))
+            return
         except Exception:
             pass
     METRICS = {"days": {}, "hours": {}}
 
-def save_metrics():
-    _atomic_write_text(METRICS_FILE, json.dumps(METRICS, indent=2))
+def load_backups_metadata():
+    global BACKUPS_METADATA
+    raw = hf_bucket_get("backups_index.json")
+    if raw:
+        try:
+            BACKUPS_METADATA = json.loads(raw.decode("utf-8"))
+            return
+        except Exception:
+            pass
+    BACKUPS_METADATA = []
+
+def save_db_now():
+    global STORAGE_BYTES
+    raw = json.dumps(DATABASE, indent=2).encode("utf-8")
+    hf_bucket_put("db.json", raw, "application/json")
+    STORAGE_BYTES = len(raw)
 
 def sync_metrics(bandwidth_bytes: int = 0):
     global METRICS_DIRTY
     now = datetime.now(timezone.utc)
     day_str = now.strftime("%Y-%m-%d")
     hour_str = now.strftime("%Y-%m-%d %H:00")
-    if "days" not in METRICS:
-        METRICS["days"] = {}
-    if "hours" not in METRICS:
-        METRICS["hours"] = {}
+    METRICS.setdefault("days", {})
+    METRICS.setdefault("hours", {})
     curr_conns = len(active_websockets)
-    if day_str not in METRICS["days"]:
-        METRICS["days"][day_str] = {
-            "bandwidth": 0,
-            "peak_connections": curr_conns,
-            "storage": STORAGE_BYTES,
-        }
-    if hour_str not in METRICS["hours"]:
-        METRICS["hours"][hour_str] = {
-            "bandwidth": 0,
-            "peak_connections": curr_conns,
-            "storage": STORAGE_BYTES,
-        }
-    if bandwidth_bytes > 0:
-        METRICS["days"][day_str]["bandwidth"] += bandwidth_bytes
-        METRICS["hours"][hour_str]["bandwidth"] += bandwidth_bytes
-    METRICS["days"][day_str]["storage"] = STORAGE_BYTES
-    METRICS["hours"][hour_str]["storage"] = STORAGE_BYTES
-    if curr_conns > METRICS["days"][day_str].get("peak_connections", 0):
-        METRICS["days"][day_str]["peak_connections"] = curr_conns
-    if curr_conns > METRICS["hours"][hour_str].get("peak_connections", 0):
-        METRICS["hours"][hour_str]["peak_connections"] = curr_conns
-    cutoff_h = (now - timedelta(hours=36)).strftime("%Y-%m-%d %H:00")
-    METRICS["hours"] = {k: v for k, v in METRICS["hours"].items() if k >= cutoff_h}
-    cutoff_d = (now - timedelta(days=60)).strftime("%Y-%m-%d")
-    METRICS["days"] = {k: v for k, v in METRICS["days"].items() if k >= cutoff_d}
+
+    for container, key in [(METRICS["days"], day_str), (METRICS["hours"], hour_str)]:
+        if key not in container:
+            container[key] = {"bandwidth": 0, "peak_connections": curr_conns, "storage": STORAGE_BYTES}
+        if bandwidth_bytes > 0:
+            container[key]["bandwidth"] += bandwidth_bytes
+        container[key]["storage"] = STORAGE_BYTES
+        if curr_conns > container[key].get("peak_connections", 0):
+            container[key]["peak_connections"] = curr_conns
+
     METRICS_DIRTY = True
 
 async def metrics_flusher():
     global METRICS_DIRTY
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(60)
         if METRICS_DIRTY:
-            await asyncio.to_thread(save_metrics)
+            await asyncio.to_thread(
+                hf_bucket_put,
+                "metrics.json",
+                json.dumps(METRICS).encode("utf-8"),
+                "application/json",
+            )
             METRICS_DIRTY = False
 
-load_rules()
-load_database()
-load_metrics()
-STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await asyncio.to_thread(load_rules)
+    await asyncio.to_thread(load_database)
+    await asyncio.to_thread(load_metrics)
+    await asyncio.to_thread(load_backups_metadata)
+    flusher_task = asyncio.create_task(metrics_flusher())
+    try:
+        yield
+    finally:
+        flusher_task.cancel()
+        if METRICS_DIRTY:
+            hf_bucket_put("metrics.json", json.dumps(METRICS).encode("utf-8"), "application/json")
+        save_db_now()
 
-@app.middleware("http")
-async def bandwidth_tracker(request: Request, call_next):
-    response = await call_next(request)
-    if (
-        not request.url.path.startswith("/api/usage")
-        and not request.url.path.startswith("/_admin")
-        and not request.url.path.startswith("/uploads")
-    ):
-        body_iterator = response.body_iterator
-        resp_body = [chunk async for chunk in body_iterator]
-        total_bytes = sum(len(chunk) for chunk in resp_body)
-        sync_metrics(bandwidth_bytes=total_bytes)
-        return Response(
-            content=b"".join(resp_body),
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type=response.media_type,
-        )
-    return response
+app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
-def _write_db_sync():
-    global STORAGE_BYTES, HF_DIRTY
-    data_str = json.dumps(DATABASE, indent=2)
-    _atomic_write_text(DB_FILE, data_str)
-    STORAGE_BYTES = len(data_str.encode("utf-8"))
-    HF_DIRTY = True
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def save_db():
-    await asyncio.to_thread(_write_db_sync)
-    sync_metrics()
-
-def _write_rules_sync():
-    global HF_DIRTY
-    _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
-    HF_DIRTY = True
-
-async def save_rules_file():
-    await asyncio.to_thread(_write_rules_sync)
+def strip_json_suffix(path: str) -> str:
+    return path[:-5] if path.endswith(".json") else path
 
 def get_nested(data: dict, path_parts: List[str]) -> Any:
-    current = data
-    for part in path_parts:
-        if not isinstance(current, dict) or part not in current:
+    curr = data
+    for p in path_parts:
+        if not isinstance(curr, dict) or p not in curr:
             return None
-        current = current[part]
-    return current
+        curr = curr[p]
+    return curr
 
 def set_nested(data: dict, path_parts: List[str], value: Any):
-    current = data
-    for part in path_parts[:-1]:
-        if part not in current or not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[path_parts[-1]] = value
+    curr = data
+    for p in path_parts[:-1]:
+        if p not in curr or not isinstance(curr[p], dict):
+            curr[p] = {}
+        curr = curr[p]
+    curr[path_parts[-1]] = value
 
 def delete_nested(data: dict, path_parts: List[str]) -> bool:
-    current = data
-    for part in path_parts[:-1]:
-        if not isinstance(current, dict) or part not in current:
+    curr = data
+    for p in path_parts[:-1]:
+        if not isinstance(curr, dict) or p not in curr:
             return False
-        current = current[part]
-    if isinstance(current, dict) and path_parts[-1] in current:
-        del current[path_parts[-1]]
+        curr = curr[p]
+    if isinstance(curr, dict) and path_parts[-1] in curr:
+        del curr[path_parts[-1]]
         return True
     return False
 
-def remove_associated_files(node: Any):
-    if isinstance(node, dict):
-        if "filename" in node and isinstance(node["filename"], str):
-            fname = os.path.basename(node["filename"])
-            fpath = os.path.join(UPLOADS_DIR, fname)
-            if os.path.isfile(fpath):
-                try:
-                    os.remove(fpath)
-                except Exception:
-                    pass
-        for val in node.values():
-            remove_associated_files(val)
-    elif isinstance(node, list):
-        for item in node:
-            remove_associated_files(item)
-
-def eval_firebase_expr(expr: Any, data_val: Any, new_data_val: Any, wildcards: Dict[str, str]) -> bool:
-    if isinstance(expr, bool):
-        return expr
-    if not isinstance(expr, str):
-        return bool(expr) if expr is not None else False
-    transformed = expr.strip()
-    if transformed.lower() in ("true", "1"):
-        return True
-    if transformed.lower() in ("false", "0"):
-        return False
-    transformed = re.sub(r"===", "==", transformed)
-    transformed = re.sub(r"!==", "!=", transformed)
-    transformed = re.sub(r"&&", " and ", transformed)
-    transformed = re.sub(r"\|\|", " or ", transformed)
-    transformed = re.sub(r"(?<![!=<>])!(?![=])", " not ", transformed)
-    transformed = re.sub(r"\btrue\b", "True", transformed)
-    transformed = re.sub(r"\bfalse\b", "False", transformed)
-    transformed = re.sub(r"\bnull\b", "None", transformed)
-    names = {
-        "now": int(time.time() * 1000),
-        "data": RuleDataSnapshot(data_val),
-        "newData": RuleDataSnapshot(new_data_val),
-        "auth": None,
-    }
-    for k, v in wildcards.items():
-        names[k] = v
-        clean_k = k.lstrip("$")
-        names[clean_k] = v
-    safe_functions = {"len": len, "int": int, "float": float, "str": str, "bool": bool}
-    try:
-        evaluator = SafeRuleEval(names=names, functions=safe_functions)
-        res = evaluator.eval(transformed)
-        return bool(res)
-    except Exception:
-        return True
-
-def check_read_permission(path_parts: List[str]) -> bool:
+def check_permission(path_parts: List[str], perm_type: str = ".read") -> bool:
     if not RULES or "rules" not in RULES:
         return True
-    current_rule = RULES.get("rules", {})
-    wildcards: Dict[str, str] = {}
-    data_val = DATABASE
-    if ".read" in current_rule:
-        if eval_firebase_expr(current_rule[".read"], data_val, None, wildcards):
-            return True
-    for i, part in enumerate(path_parts):
-        if not isinstance(current_rule, dict):
-            break
-        current_sub_path = path_parts[: i + 1]
-        data_val = get_nested(DATABASE, current_sub_path)
-        matched_key = None
-        if part in current_rule:
-            matched_key = part
-        else:
-            for k in current_rule.keys():
-                if k.startswith("$"):
-                    matched_key = k
-                    wildcards[k] = part
-                    break
-        if matched_key:
-            current_rule = current_rule[matched_key]
-            if isinstance(current_rule, dict) and ".read" in current_rule:
-                if eval_firebase_expr(current_rule[".read"], data_val, None, wildcards):
-                    return True
-        else:
-            break
-    return False
-
-def check_write_permission(path_parts: List[str], new_payload: Any) -> bool:
-    if not RULES or "rules" not in RULES:
-        return True
-    current_rule = RULES.get("rules", {})
-    wildcards: Dict[str, str] = {}
-    existing_val = get_nested(DATABASE, path_parts) if path_parts else DATABASE
-    if ".write" in current_rule:
-        if eval_firebase_expr(current_rule[".write"], existing_val, new_payload, wildcards):
-            return True
-    for i, part in enumerate(path_parts):
-        if not isinstance(current_rule, dict):
-            break
-        current_sub_path = path_parts[: i + 1]
-        data_val = get_nested(DATABASE, current_sub_path)
-        matched_key = None
-        if part in current_rule:
-            matched_key = part
-        else:
-            for k in current_rule.keys():
-                if k.startswith("$"):
-                    matched_key = k
-                    wildcards[k] = part
-                    break
-        if matched_key:
-            current_rule = current_rule[matched_key]
-            if isinstance(current_rule, dict) and ".write" in current_rule:
-                target_new = new_payload if i == len(path_parts) - 1 else None
-                if eval_firebase_expr(current_rule[".write"], data_val, target_new, wildcards):
-                    return True
-        else:
-            break
-    return False
-
-def validate_rules_recursively(rule_node: Any, data_node: Any, wildcards: Dict[str, str]) -> bool:
-    if not isinstance(rule_node, dict):
-        return True
-    if ".validate" in rule_node:
-        expr = rule_node[".validate"]
-        if not eval_firebase_expr(expr, None, data_node, wildcards):
-            return False
-    if isinstance(data_node, dict):
-        for k, v in data_node.items():
-            matched_rule = None
-            next_wildcards = copy.copy(wildcards)
-            if k in rule_node:
-                matched_rule = rule_node[k]
-            else:
-                for rk in rule_node.keys():
-                    if rk.startswith("$"):
-                        matched_rule = rule_node[rk]
-                        next_wildcards[rk] = str(k)
-                        break
-            if matched_rule and isinstance(matched_rule, dict):
-                if not validate_rules_recursively(matched_rule, v, next_wildcards):
-                    return False
-    return True
-
-def check_validation(path_parts: List[str], new_payload: Any) -> bool:
-    if not RULES or "rules" not in RULES:
-        return True
-    current_rule = RULES.get("rules", {})
-    wildcards: Dict[str, str] = {}
-    for part in path_parts:
-        if not isinstance(current_rule, dict):
-            return True
-        matched_key = None
-        if part in current_rule:
-            matched_key = part
-        else:
-            for k in current_rule.keys():
-                if k.startswith("$"):
-                    matched_key = k
-                    wildcards[k] = part
-                    break
-        if matched_key:
-            current_rule = current_rule[matched_key]
-        else:
-            return True
-    return validate_rules_recursively(current_rule, new_payload, wildcards)
+    return bool(RULES.get("rules", {}).get(perm_type, True))
 
 async def broadcast(path: str, value: Any, event_type: str = "put"):
     clean_target = path.strip("/")
     raw_payload = json.dumps({"path": clean_target, "event": event_type, "data": value})
     payload_bytes = len(raw_payload.encode("utf-8"))
-    total_sent = 0
     for sub_path, sockets in list(subscriptions.items()):
-        if (
-            clean_target == sub_path
-            or clean_target.startswith(sub_path + "/")
-            or sub_path.startswith(clean_target + "/")
-            or sub_path == ""
-        ):
-            dead_list = []
-            for ws in sockets:
+        if clean_target == sub_path or clean_target.startswith(sub_path + "/") or sub_path == "":
+            for ws in list(sockets):
                 try:
                     await ws.send_text(raw_payload)
-                    total_sent += payload_bytes
                 except Exception:
-                    dead_list.append(ws)
-            for ws in dead_list:
-                active_websockets.discard(ws)
-                if ws in sockets:
                     sockets.remove(ws)
-    if total_sent > 0:
-        sync_metrics(bandwidth_bytes=total_sent)
+                    active_websockets.discard(ws)
+    sync_metrics(bandwidth_bytes=payload_bytes)
 
 async def extract_request_payload(request: Request) -> Any:
     try:
@@ -669,8 +389,8 @@ HTML_CONSOLE = """
         <div id="tab-rules" class="hidden min-h-full flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (rules.json)</h2>
-                    <p class="text-xs text-gray-500">Edit and publish rules directly to persistent storage.</p>
+                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (Hugging Face Bucket)</h2>
+                    <p class="text-xs text-gray-500">Live rules stored directly in your bucket.</p>
                 </div>
                 <div class="flex gap-2">
                     <button onclick="loadRules()" class="bg-gray-100 hover:bg-gray-200 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5">
@@ -687,8 +407,8 @@ HTML_CONSOLE = """
         <div id="tab-backups" class="hidden min-h-full space-y-4">
             <div class="flex justify-between items-center">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Automated & Manual Backups</h2>
-                    <p class="text-xs text-gray-500">Snapshots saved in backups directory.</p>
+                    <h2 class="text-sm font-semibold text-gray-800">Hugging Face Bucket Snapshots</h2>
+                    <p class="text-xs text-gray-500">Snapshots saved in your cloud bucket.</p>
                 </div>
                 <button onclick="createBackup()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 shadow-xs">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
@@ -878,7 +598,7 @@ HTML_CONSOLE = """
                 const text = document.getElementById('rules-editor').value;
                 const parsed = JSON.parse(text);
                 const res = await fetch('/_admin/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(parsed) });
-                if (res.ok) alert('Rules saved successfully!');
+                if (res.ok) alert('Rules saved to Hugging Face Bucket successfully!');
                 else alert('Failed to publish rules');
             } catch (e) { alert('Invalid JSON syntax: ' + e.message); }
         }
@@ -1214,25 +934,17 @@ async def serve_dashboard(request: Request):
 @app.get("/uploads/{filename:path}")
 async def serve_upload_file(filename: str):
     clean_name = os.path.basename(filename)
-    fpath = os.path.join(UPLOADS_DIR, clean_name)
-    if not os.path.isfile(fpath):
-        await run_hf_sync("pull")
-    if os.path.isfile(fpath):
-        return FileResponse(fpath)
+    raw = await asyncio.to_thread(hf_bucket_get, f"uploads/{clean_name}")
+    if raw:
+        import mimetypes
+        mime_type = mimetypes.guess_type(clean_name)[0] or "application/octet-stream"
+        return Response(content=raw, media_type=mime_type)
     raise HTTPException(status_code=404, detail="File not found")
 
 @app.delete("/uploads/{filename:path}")
 async def delete_upload_file(filename: str):
-    global HF_DIRTY
     clean_name = os.path.basename(filename)
-    fpath = os.path.join(UPLOADS_DIR, clean_name)
-    if os.path.isfile(fpath):
-        try:
-            os.remove(fpath)
-        except Exception:
-            pass
-
-    HF_DIRTY = True
+    await asyncio.to_thread(hf_bucket_delete, f"uploads/{clean_name}")
 
     def remove_db_refs(node):
         changed = False
@@ -1256,9 +968,9 @@ async def delete_upload_file(filename: str):
     async with db_lock:
         db_changed = remove_db_refs(DATABASE)
         if db_changed:
-            await save_db()
+            await asyncio.to_thread(save_db_now)
             await broadcast("", DATABASE, "put")
-            
+
     return {"status": "deleted", "filename": clean_name}
 
 @app.post("/api/upload")
@@ -1268,75 +980,53 @@ async def upload_media_file(
     target_path: str = Form("uploads"),
     is_public: str = Form("false"),
 ):
-    global HF_DIRTY
     push_id = generate_push_id()
     original_name = file.filename or "file"
     _, ext = os.path.splitext(original_name)
     saved_filename = f"{push_id}{ext}"
-    dest_path = os.path.join(UPLOADS_DIR, saved_filename)
-    size = 0
-    try:
-        with open(dest_path, "wb") as buffer:
-            while chunk := await file.read(1024 * 1024):
-                buffer.write(chunk)
-                size += len(chunk)
-    except Exception as e:
-        traceback.print_exc()
-        if os.path.exists(dest_path):
-            try:
-                os.remove(dest_path)
-            except Exception:
-                pass
-        raise HTTPException(status_code=500, detail=f"Failed to write file: {str(e)}")
-    
-    public_bool = is_public.lower() in ("true", "1", "yes")
-    
-    if public_bool:
-        is_nsfw = await asyncio.to_thread(check_nsfw_image, dest_path)
-        if is_nsfw:
-            if os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Explicit content is not allowed."
-            )
+    content = await file.read()
 
-    HF_DIRTY = True
+    public_bool = is_public.lower() in ("true", "1", "yes")
+    if public_bool and check_nsfw_image_bytes(content, ext):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Explicit content is not allowed."
+        )
+
+    remote_file_path = f"uploads/{saved_filename}"
+    uploaded = await asyncio.to_thread(
+        hf_bucket_put,
+        remote_file_path,
+        content,
+        file.content_type or "application/octet-stream"
+    )
+    if not uploaded:
+        raise HTTPException(status_code=500, detail="Failed to upload file to Hugging Face Bucket")
 
     base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else str(request.base_url).rstrip("/")
     if base_url.startswith("http://") and ("hf.space" in base_url or "huggingface.co" in base_url):
         base_url = "https://" + base_url[7:]
     file_url = f"{base_url}/uploads/{saved_filename}"
-        
+
     record = {
         "id": push_id,
         "name": original_name,
         "filename": saved_filename,
         "url": file_url,
         "content_type": file.content_type,
-        "size": size,
+        "size": len(content),
         "is_public": public_bool,
         "timestamp": int(time.time() * 1000),
     }
+
     path_parts = [p for p in target_path.strip("/").split("/") if p] + [push_id]
-    if not check_write_permission(path_parts, record):
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, record):
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-    
     clean_path = "/".join(path_parts)
+
     async with db_lock:
         set_nested(DATABASE, path_parts, record)
-        await save_db()
+        await asyncio.to_thread(save_db_now)
         await broadcast(clean_path, record, "put")
-        
+
     return {"status": "success", "path": clean_path, "data": record}
 
 @app.get("/api-data")
@@ -1351,7 +1041,6 @@ async def get_raw_data(full_path: str = ""):
 
 @app.get("/_admin/rules")
 async def get_rules():
-    load_rules()
     return RULES
 
 @app.post("/_admin/rules")
@@ -1360,68 +1049,74 @@ async def update_rules(request: Request):
     new_rules = await extract_request_payload(request)
     if isinstance(new_rules, dict):
         RULES = new_rules
-        await save_rules_file()
+        await asyncio.to_thread(
+            hf_bucket_put,
+            "rules.json",
+            json.dumps(RULES, indent=2).encode("utf-8"),
+            "application/json",
+        )
         return {"status": "success", "rules": RULES}
     raise HTTPException(status_code=400, detail="Invalid rules format")
 
 @app.get("/_admin/backups")
 async def list_backups():
-    files = []
-    for f in sorted(os.listdir(BACKUPS_DIR), reverse=True):
-        if f.endswith(".json"):
-            fp = os.path.join(BACKUPS_DIR, f)
-            stat = os.stat(fp)
-            files.append(
-                {
-                    "filename": f,
-                    "date": datetime.fromtimestamp(stat.st_mtime, timezone.utc).strftime("%b %d, %Y %I:%M %p"),
-                    "size": stat.st_size,
-                }
-            )
-    return files
+    return BACKUPS_METADATA
 
 @app.post("/_admin/backups")
 async def make_backup():
-    global HF_DIRTY
     filename = f"backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-    dest = _safe_backup_path(filename)
-    async with db_lock:
-        data_str = json.dumps(DATABASE, indent=2)
-        await asyncio.to_thread(_atomic_write_text, dest, data_str)
-    HF_DIRTY = True
+    raw = json.dumps(DATABASE, indent=2).encode("utf-8")
+    await asyncio.to_thread(hf_bucket_put, f"backups/{filename}", raw, "application/json")
+
+    backup_info = {
+        "filename": filename,
+        "date": datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p"),
+        "size": len(raw),
+    }
+    BACKUPS_METADATA.insert(0, backup_info)
+    await asyncio.to_thread(
+        hf_bucket_put,
+        "backups_index.json",
+        json.dumps(BACKUPS_METADATA).encode("utf-8"),
+        "application/json",
+    )
     return {"status": "created", "filename": filename}
 
 @app.post("/_admin/backups/restore/{filename}")
 async def restore_backup(filename: str):
-    src = _safe_backup_path(filename)
-    if not os.path.exists(src):
-        raise HTTPException(status_code=404, detail="Backup file not found")
-    def _read():
-        with open(src, "r", encoding="utf-8") as f:
-            return json.load(f)
-    data = await asyncio.to_thread(_read)
+    clean_name = os.path.basename(filename)
+    raw = await asyncio.to_thread(hf_bucket_get, f"backups/{clean_name}")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Backup file not found in bucket")
+    data = json.loads(raw.decode("utf-8"))
     async with db_lock:
         DATABASE.clear()
         if isinstance(data, dict):
             DATABASE.update(data)
-        await save_db()
+        await asyncio.to_thread(save_db_now)
         await broadcast("", DATABASE, "put")
     return {"status": "restored"}
 
 @app.get("/_admin/backups/download/{filename}")
 async def download_backup(filename: str):
-    fp = _safe_backup_path(filename)
-    if not os.path.exists(fp):
+    clean_name = os.path.basename(filename)
+    raw = await asyncio.to_thread(hf_bucket_get, f"backups/{clean_name}")
+    if not raw:
         raise HTTPException(status_code=404, detail="Backup file not found")
-    return FileResponse(fp, media_type="application/json", filename=os.path.basename(fp))
+    return Response(content=raw, media_type="application/json")
 
 @app.delete("/_admin/backups/{filename}")
 async def delete_backup(filename: str):
-    global HF_DIRTY
-    fp = _safe_backup_path(filename)
-    if os.path.exists(fp):
-        os.remove(fp)
-    HF_DIRTY = True
+    clean_name = os.path.basename(filename)
+    await asyncio.to_thread(hf_bucket_delete, f"backups/{clean_name}")
+    global BACKUPS_METADATA
+    BACKUPS_METADATA = [b for b in BACKUPS_METADATA if b["filename"] != clean_name]
+    await asyncio.to_thread(
+        hf_bucket_put,
+        "backups_index.json",
+        json.dumps(BACKUPS_METADATA).encode("utf-8"),
+        "application/json",
+    )
     return {"status": "deleted"}
 
 @app.get("/api/usage")
@@ -1436,7 +1131,7 @@ async def get_usage_metrics():
         if bytes_num >= 1024:
             return f"{bytes_num / 1024:.2f} KB"
         return f"{bytes_num} B"
-    
+
     daily_history = []
     daily_bandwidth = 0
     for i in range(23, -1, -1):
@@ -1449,7 +1144,7 @@ async def get_usage_metrics():
         s = rec.get("storage", storage_bytes)
         daily_bandwidth += b
         daily_history.append({"date": h_label, "bandwidth": b, "connections": c, "storage": s})
-        
+
     weekly_history = []
     weekly_bandwidth = 0
     for i in range(6, -1, -1):
@@ -1462,7 +1157,7 @@ async def get_usage_metrics():
         s = rec.get("storage", storage_bytes)
         weekly_bandwidth += b
         weekly_history.append({"date": d_label, "bandwidth": b, "connections": c, "storage": s})
-        
+
     monthly_history = []
     monthly_bandwidth = 0
     for i in range(29, -1, -1):
@@ -1475,7 +1170,7 @@ async def get_usage_metrics():
         s = rec.get("storage", storage_bytes)
         monthly_bandwidth += b
         monthly_history.append({"date": d_label, "bandwidth": b, "connections": c, "storage": s})
-        
+
     return {
         "connections": len(active_websockets),
         "storage_bytes": storage_bytes,
@@ -1502,13 +1197,10 @@ async def get_usage_metrics():
 @app.get("/{full_path:path}")
 async def read_endpoint(request: Request, full_path: str, shallow: bool = False):
     full_path = strip_json_suffix(full_path)
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_read_permission(path_parts):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not path_parts:
-        data = DATABASE
-    else:
-        data = get_nested(DATABASE, path_parts)
+    parts = [p for p in full_path.strip("/").split("/") if p]
+    if not check_permission(parts, ".read"):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    data = DATABASE if not parts else get_nested(DATABASE, parts)
     if data is None:
         return None
     if shallow and isinstance(data, dict):
@@ -1520,22 +1212,20 @@ async def read_endpoint(request: Request, full_path: str, shallow: bool = False)
 async def write_endpoint(request: Request, full_path: str = ""):
     payload = await extract_request_payload(request)
     full_path = strip_json_suffix(full_path)
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_write_permission(path_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-    clean_path = "/".join(path_parts)
+    parts = [p for p in full_path.strip("/").split("/") if p]
+    if not check_permission(parts, ".write"):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    clean_path = "/".join(parts)
     async with db_lock:
-        if not path_parts:
+        if not parts:
             DATABASE.clear()
             if isinstance(payload, dict):
                 DATABASE.update(payload)
             else:
                 DATABASE["data"] = payload
         else:
-            set_nested(DATABASE, path_parts, payload)
-        await save_db()
+            set_nested(DATABASE, parts, payload)
+        await asyncio.to_thread(save_db_now)
         await broadcast(clean_path, payload, "put")
     return payload
 
@@ -1546,22 +1236,20 @@ async def patch_endpoint(request: Request, full_path: str = ""):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Patch payload must be an object")
     full_path = strip_json_suffix(full_path)
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_write_permission(path_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-    clean_path = "/".join(path_parts)
+    parts = [p for p in full_path.strip("/").split("/") if p]
+    if not check_permission(parts, ".write"):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    clean_path = "/".join(parts)
     async with db_lock:
-        if not path_parts:
+        if not parts:
             DATABASE.update(payload)
         else:
-            target = get_nested(DATABASE, path_parts)
+            target = get_nested(DATABASE, parts)
             if not isinstance(target, dict):
                 target = {}
-                set_nested(DATABASE, path_parts, target)
+                set_nested(DATABASE, parts, target)
             target.update(payload)
-        await save_db()
+        await asyncio.to_thread(save_db_now)
         await broadcast(clean_path, payload, "patch")
     return payload
 
@@ -1570,17 +1258,15 @@ async def patch_endpoint(request: Request, full_path: str = ""):
 async def post_push_endpoint(request: Request, full_path: str = ""):
     payload = await extract_request_payload(request)
     full_path = strip_json_suffix(full_path)
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
+    parts = [p for p in full_path.strip("/").split("/") if p]
     push_id = generate_push_id()
-    target_parts = path_parts + [push_id]
-    if not check_write_permission(target_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(target_parts, payload):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
+    target_parts = parts + [push_id]
+    if not check_permission(target_parts, ".write"):
+        raise HTTPException(status_code=403, detail="Permission denied")
     clean_path = "/".join(target_parts)
     async with db_lock:
         set_nested(DATABASE, target_parts, payload)
-        await save_db()
+        await asyncio.to_thread(save_db_now)
         await broadcast(clean_path, payload, "put")
     return {"name": push_id}
 
@@ -1588,38 +1274,29 @@ async def post_push_endpoint(request: Request, full_path: str = ""):
 @app.delete("/")
 async def delete_endpoint(full_path: str = ""):
     full_path = strip_json_suffix(full_path)
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_write_permission(path_parts, None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    clean_path = "/".join(path_parts)
+    parts = [p for p in full_path.strip("/").split("/") if p]
+    if not check_permission(parts, ".write"):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    clean_path = "/".join(parts)
     async with db_lock:
-        if not path_parts:
-            remove_associated_files(DATABASE)
+        if not parts:
             DATABASE.clear()
         else:
-            target = get_nested(DATABASE, path_parts)
-            if target is not None:
-                remove_associated_files(target)
-            delete_nested(DATABASE, path_parts)
-        await save_db()
+            delete_nested(DATABASE, parts)
+        await asyncio.to_thread(save_db_now)
         await broadcast(clean_path, None, "delete")
     return {"status": "deleted", "path": clean_path}
 
 @app.websocket("/ws/{full_path:path}")
 @app.websocket("/ws/")
 async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
-    path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if path_parts and not check_read_permission(path_parts):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+    parts = [p for p in full_path.strip("/").split("/") if p]
     await websocket.accept()
     active_websockets.add(websocket)
-    clean_path = "/".join(path_parts)
-    if clean_path not in subscriptions:
-        subscriptions[clean_path] = []
-    subscriptions[clean_path].append(websocket)
-    current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
-    conn_msg = json.dumps({"event": "connected", "path": clean_path, "data": current_data})
+    clean_path = "/".join(parts)
+    subscriptions.setdefault(clean_path, []).append(websocket)
+    data = get_nested(DATABASE, parts) if parts else DATABASE
+    conn_msg = json.dumps({"event": "connected", "path": clean_path, "data": data})
     await websocket.send_text(conn_msg)
     sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8")))
     try:
