@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
-HF_TOKEN = os.getenv("HF_TOKEN", "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")
+HF_TOKEN = os.getenv("HF_TOKEN", "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")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
