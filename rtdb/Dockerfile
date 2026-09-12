@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV STORAGE_DIR=/data
+ENV STORAGE_DIR=/app/storage
 ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-VOLUME ["/data"]
+RUN mkdir -p /app/storage
 
 EXPOSE 8000
 
