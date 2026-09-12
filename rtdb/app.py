@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import shutil
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -14,17 +15,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from PIL import Image
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 from huggingface_hub import HfApi, hf_hub_download
 
-# ==========================================
-# HUGGING FACE CONFIGURATION (DUMMY VALUES)
-# Yaha apna Token aur Repo ID daalein (ya Render Environment Variables me set karein)
-HF_TOKEN = os.getenv("HF_TOKEN", "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")  # token
-HF_REPO_ID = os.getenv("HF_REPO_ID", "plygram/backend")  # repo (e.g. shkumaraman/my-storage)
-# ==========================================
-
+HF_TOKEN = os.getenv("HF_TOKEN", "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")
+HF_REPO_ID = os.getenv("HF_REPO_ID", "plygram/backend")
 hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
 
 def check_nsfw_image(file_path: str) -> bool:
@@ -63,10 +58,14 @@ async def lifespan(app: FastAPI):
     if hf_api and HF_REPO_ID:
         try:
             db_path = hf_hub_download(repo_id=HF_REPO_ID, filename="db.json", repo_type="dataset", token=HF_TOKEN)
-            import shutil
             shutil.copy(db_path, DB_FILE)
             rules_path = hf_hub_download(repo_id=HF_REPO_ID, filename="rules.json", repo_type="dataset", token=HF_TOKEN)
             shutil.copy(rules_path, RULES_FILE)
+            repo_files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=HF_REPO_ID, repo_type="dataset")
+            for f in repo_files:
+                if f.startswith("backups/") and f.endswith(".json"):
+                    b_path = hf_hub_download(repo_id=HF_REPO_ID, filename=f, repo_type="dataset", token=HF_TOKEN)
+                    shutil.copy(b_path, os.path.join(BACKUPS_DIR, os.path.basename(f)))
         except Exception:
             pass
 
@@ -1335,6 +1334,19 @@ async def make_backup():
     async with db_lock:
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
+        
+    if hf_api and HF_REPO_ID:
+        try:
+            await asyncio.to_thread(
+                hf_api.upload_file,
+                path_or_fileobj=dest,
+                path_in_repo=f"backups/{filename}",
+                repo_id=HF_REPO_ID,
+                repo_type="dataset"
+            )
+        except Exception:
+            pass
+            
     return {"status": "created", "filename": filename}
 
 @app.post("/_admin/backups/restore/{filename}")
@@ -1366,6 +1378,17 @@ async def delete_backup(filename: str):
     fp = _safe_backup_path(filename)
     if os.path.exists(fp):
         os.remove(fp)
+    if hf_api and HF_REPO_ID:
+        try:
+            clean_name = os.path.basename(filename)
+            await asyncio.to_thread(
+                hf_api.delete_file,
+                path_in_repo=f"backups/{clean_name}",
+                repo_id=HF_REPO_ID,
+                repo_type="dataset"
+            )
+        except Exception:
+            pass
     return {"status": "deleted"}
 
 @app.get("/api/usage")
