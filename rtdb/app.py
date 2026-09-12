@@ -16,14 +16,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from PIL import Image
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
+from huggingface_hub import HfApi, hf_hub_download
 
-import opennsfw2 as n2 
+# ==========================================
+# HUGGING FACE CONFIGURATION (DUMMY VALUES)
+# Yaha apna Token aur Repo ID daalein (ya Render Environment Variables me set karein)
+HF_TOKEN = os.getenv("HF_TOKEN", "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")  # token
+HF_REPO_ID = os.getenv("HF_REPO_ID", "plygram/backend")  # repo (e.g. shkumaraman/my-storage)
+# ==========================================
+
+hf_api = HfApi(token=HF_TOKEN) if HF_TOKEN else None
 
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
         return False
     try:
+        import opennsfw2 as n2
         nsfw_prob = n2.predict_image(file_path)
         if nsfw_prob >= 0.75:
             return True
@@ -31,19 +40,54 @@ def check_nsfw_image(file_path: str) -> bool:
         return False
     return False
 
+HF_DB_DIRTY = False
+HF_RULES_DIRTY = False
+
+async def hf_sync_worker():
+    global HF_DB_DIRTY, HF_RULES_DIRTY
+    while True:
+        await asyncio.sleep(30)
+        if hf_api and HF_REPO_ID:
+            try:
+                if HF_DB_DIRTY:
+                    await asyncio.to_thread(hf_api.upload_file, path_or_fileobj=DB_FILE, path_in_repo="db.json", repo_id=HF_REPO_ID, repo_type="dataset")
+                    HF_DB_DIRTY = False
+                if HF_RULES_DIRTY:
+                    await asyncio.to_thread(hf_api.upload_file, path_or_fileobj=RULES_FILE, path_in_repo="rules.json", repo_id=HF_REPO_ID, repo_type="dataset")
+                    HF_RULES_DIRTY = False
+            except Exception:
+                pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if hf_api and HF_REPO_ID:
+        try:
+            db_path = hf_hub_download(repo_id=HF_REPO_ID, filename="db.json", repo_type="dataset", token=HF_TOKEN)
+            import shutil
+            shutil.copy(db_path, DB_FILE)
+            rules_path = hf_hub_download(repo_id=HF_REPO_ID, filename="rules.json", repo_type="dataset", token=HF_TOKEN)
+            shutil.copy(rules_path, RULES_FILE)
+        except Exception:
+            pass
+
+    load_rules()
+    load_database()
+    load_metrics()
+    
     flusher_task = asyncio.create_task(metrics_flusher())
+    hf_task = asyncio.create_task(hf_sync_worker())
     try:
         yield
     finally:
         flusher_task.cancel()
-        try:
-            await flusher_task
-        except asyncio.CancelledError:
-            pass
+        hf_task.cancel()
         if METRICS_DIRTY:
             await asyncio.to_thread(save_metrics)
+        if HF_DB_DIRTY and hf_api:
+            try:
+                hf_api.upload_file(path_or_fileobj=DB_FILE, path_in_repo="db.json", repo_id=HF_REPO_ID, repo_type="dataset")
+            except Exception:
+                pass
 
 app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
@@ -274,17 +318,20 @@ async def bandwidth_tracker(request: Request, call_next):
     return response
 
 def _write_db_sync():
-    global STORAGE_BYTES
+    global STORAGE_BYTES, HF_DB_DIRTY
     data_str = json.dumps(DATABASE, indent=2)
     _atomic_write_text(DB_FILE, data_str)
     STORAGE_BYTES = len(data_str.encode("utf-8"))
+    HF_DB_DIRTY = True
 
 async def save_db():
     await asyncio.to_thread(_write_db_sync)
     sync_metrics()
 
 def _write_rules_sync():
+    global HF_RULES_DIRTY
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
+    HF_RULES_DIRTY = True
 
 async def save_rules_file():
     await asyncio.to_thread(_write_rules_sync)
@@ -749,7 +796,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -1200,8 +1247,21 @@ async def upload_media_file(
                 detail="Explicit content is not allowed."
             )
             
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/uploads/{saved_filename}"
+    if hf_api and HF_REPO_ID:
+        try:
+            await asyncio.to_thread(
+                hf_api.upload_file, 
+                path_or_fileobj=dest_path, 
+                path_in_repo=f"uploads/{saved_filename}", 
+                repo_id=HF_REPO_ID, 
+                repo_type="dataset"
+            )
+            file_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/uploads/{saved_filename}"
+        except Exception:
+            file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
+    else:
+        file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
+        
     record = {
         "id": push_id,
         "name": original_name,
