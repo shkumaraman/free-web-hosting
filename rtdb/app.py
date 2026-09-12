@@ -48,16 +48,12 @@ async def run_hf_sync(direction: str):
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
     env = os.environ.copy()
-    env["HF_TOKEN"] = HF_TOKEN
-    env["HF_ACCESS_TOKEN"] = HF_TOKEN
-    env["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
-    
     hf_bin = get_hf_cmd()
 
     if direction == "pull":
-        cmd = [hf_bin, "sync", f"hf://buckets/{BUCKET_NAME}", STORAGE_DIR]
+        cmd = [hf_bin, "sync", "--token", HF_TOKEN, f"hf://buckets/{BUCKET_NAME}", STORAGE_DIR]
     else:
-        cmd = [hf_bin, "sync", STORAGE_DIR, f"hf://buckets/{BUCKET_NAME}"]
+        cmd = [hf_bin, "sync", "--token", HF_TOKEN, STORAGE_DIR, f"hf://buckets/{BUCKET_NAME}"]
 
     try:
         async with HF_SYNC_LOCK:
@@ -1188,7 +1184,6 @@ async def make_backup():
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
     
-    # Push immediately to HF Bucket
     await run_hf_sync("push")
     return {"status": "created", "filename": filename}
 
