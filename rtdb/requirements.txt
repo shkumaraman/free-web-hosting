@@ -7,4 +7,4 @@ simpleeval
 opennsfw2
 tf-keras
 tensorflow-cpu
-huggingface_hub
+huggingface_hub[cli]
