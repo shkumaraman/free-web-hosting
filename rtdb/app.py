@@ -61,6 +61,29 @@ async def run_cloud_sync(direction: str):
     except Exception as e:
         print(f"[Cloud Sync] Execution error: {e}")
 
+async def run_cloud_delete(relative_path: str):
+    if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        return
+    env = os.environ.copy()
+    cmd_bin = get_cloud_cmd()
+
+    cmd = [cmd_bin, "rm", "--token", HF_TOKEN, f"hf://buckets/{BUCKET_NAME}/{relative_path}"]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            print(f"[Cloud Sync] (delete) success: {relative_path}")
+        else:
+            print(f"[Cloud Sync] (delete) error: {stderr.decode().strip()}")
+    except Exception as e:
+        print(f"[Cloud Sync] Delete Execution error: {e}")
+
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
@@ -637,16 +660,16 @@ HTML_CONSOLE = """
         <div id="tab-backups" class="hidden min-h-full space-y-4">
             <div class="flex justify-between items-center">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Automated & Manual Backups</h2>
-                    <p class="text-xs text-gray-500">Snapshots saved in /data/backups/ directory.</p>
+                    <h2 class="text-sm font-semibold text-gray-800">Database Backups</h2>
+                    <p class="text-xs text-gray-500">Create and manage snapshots of your database.</p>
                 </div>
                 <button onclick="createBackup()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 shadow-xs">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                     <span>Create</span>
                 </button>
             </div>
-            <div class="border border-gray-200 rounded-lg overflow-hidden">
-                <table class="w-full text-left text-xs">
+            <div class="border border-gray-200 rounded-lg overflow-x-auto w-full">
+                <table class="w-full text-left text-xs whitespace-nowrap min-w-max">
                     <thead class="bg-gray-50 border-b border-gray-200 text-gray-500 font-medium">
                         <tr>
                             <th class="px-4 py-2.5">Backup File</th>
@@ -798,7 +821,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -1207,6 +1230,7 @@ async def delete_upload_file(filename: str):
             await save_db()
             await broadcast("", DATABASE, "put")
     
+    asyncio.create_task(run_cloud_delete(f"uploads/{clean_name}"))
     asyncio.create_task(run_cloud_sync("push"))
     return {"status": "deleted", "filename": clean_name}
 
@@ -1362,7 +1386,8 @@ async def delete_backup(filename: str):
     if os.path.exists(fp):
         os.remove(fp)
     
-    await run_cloud_sync("push")
+    asyncio.create_task(run_cloud_delete(f"backups/{filename}"))
+    asyncio.create_task(run_cloud_sync("push"))
     return {"status": "deleted"}
 
 @app.get("/api/usage")
