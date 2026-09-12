@@ -66,23 +66,35 @@ async def run_cloud_delete(relative_path: str):
         return
     env = os.environ.copy()
     cmd_bin = get_cloud_cmd()
-
     cmd = [cmd_bin, "rm", "--token", HF_TOKEN, f"hf://buckets/{BUCKET_NAME}/{relative_path}"]
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            print(f"[Cloud Sync] (delete) success: {relative_path}")
-        else:
-            print(f"[Cloud Sync] (delete) error: {stderr.decode().strip()}")
-    except Exception as e:
-        print(f"[Cloud Sync] Delete Execution error: {e}")
+    async with CLOUD_SYNC_LOCK:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await proc.communicate(input=b"y\n")
+            if proc.returncode == 0:
+                print(f"[Cloud Sync] (delete) success: {relative_path}")
+                return
+            else:
+                print(f"[Cloud Sync] (delete) CLI error: {stderr.decode().strip()}")
+        except Exception as e:
+            print(f"[Cloud Sync] Delete CLI execution error: {e}")
+        
+        def _python_delete():
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi(token=HF_TOKEN)
+                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="dataset")
+                print(f"[Cloud Sync] (delete) success via API fallback: {relative_path}")
+            except Exception:
+                pass
+        await asyncio.to_thread(_python_delete)
 
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
@@ -388,7 +400,8 @@ def delete_nested(data: dict, path_parts: List[str]) -> bool:
         return True
     return False
 
-def remove_associated_files(node: Any):
+def remove_associated_files(node: Any) -> List[str]:
+    deleted_paths = []
     if isinstance(node, dict):
         if "filename" in node and isinstance(node["filename"], str):
             fname = os.path.basename(node["filename"])
@@ -396,13 +409,15 @@ def remove_associated_files(node: Any):
             if os.path.isfile(fpath):
                 try:
                     os.remove(fpath)
+                    deleted_paths.append(f"uploads/{fname}")
                 except Exception:
                     pass
         for val in node.values():
-            remove_associated_files(val)
+            deleted_paths.extend(remove_associated_files(val))
     elif isinstance(node, list):
         for item in node:
-            remove_associated_files(item)
+            deleted_paths.extend(remove_associated_files(item))
+    return deleted_paths
 
 def eval_firebase_expr(expr: Any, data_val: Any, new_data_val: Any, wildcards: Dict[str, str]) -> bool:
     if isinstance(expr, bool):
@@ -1230,8 +1245,11 @@ async def delete_upload_file(filename: str):
             await save_db()
             await broadcast("", DATABASE, "put")
     
-    asyncio.create_task(run_cloud_delete(f"uploads/{clean_name}"))
-    asyncio.create_task(run_cloud_sync("push"))
+    async def _delete_task():
+        await run_cloud_delete(f"uploads/{clean_name}")
+        await run_cloud_sync("push")
+
+    asyncio.create_task(_delete_task())
     return {"status": "deleted", "filename": clean_name}
 
 @app.post("/api/upload")
@@ -1386,8 +1404,11 @@ async def delete_backup(filename: str):
     if os.path.exists(fp):
         os.remove(fp)
     
-    asyncio.create_task(run_cloud_delete(f"backups/{filename}"))
-    asyncio.create_task(run_cloud_sync("push"))
+    async def _delete_task():
+        await run_cloud_delete(f"backups/{filename}")
+        await run_cloud_sync("push")
+
+    asyncio.create_task(_delete_task())
     return {"status": "deleted"}
 
 @app.get("/api/usage")
@@ -1551,17 +1572,27 @@ async def delete_endpoint(full_path: str = ""):
     if not check_write_permission(path_parts, None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     clean_path = "/".join(path_parts)
+    
+    del_paths = []
     async with db_lock:
         if not path_parts:
-            remove_associated_files(DATABASE)
+            del_paths.extend(remove_associated_files(DATABASE))
             DATABASE.clear()
         else:
             target = get_nested(DATABASE, path_parts)
             if target is not None:
-                remove_associated_files(target)
+                del_paths.extend(remove_associated_files(target))
             delete_nested(DATABASE, path_parts)
         await save_db()
         await broadcast(clean_path, None, "delete")
+        
+    if del_paths:
+        async def _del_files():
+            for p in del_paths:
+                await run_cloud_delete(p)
+            await run_cloud_sync("push")
+        asyncio.create_task(_del_files())
+        
     return {"status": "deleted", "path": clean_path}
 
 @app.websocket("/ws/{full_path:path}")
