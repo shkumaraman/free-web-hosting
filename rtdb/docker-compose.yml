@@ -1,7 +1,7 @@
 services:
-  realtime-db:
+  rtdb:
     build: .
-    container_name: realtime-database
+    container_name: rtdb
     restart: always
     ports:
       - "8000:8000"
