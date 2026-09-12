@@ -16,20 +16,76 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
-from huggingface_hub import HfApi
 
 HF_TOKEN = os.getenv("HF_TOKEN", "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")
-HF_REPO_ID = os.getenv("HF_REPO_ID", "plygram/backend")
-HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset")
+BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
-api = None
-if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
+STORAGE_DIR = os.getenv("STORAGE_DIR", "/data")
+RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
+DB_FILE = os.path.join(STORAGE_DIR, "db.json")
+METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
+BACKUPS_DIR = os.path.join(STORAGE_DIR, "backups")
+UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
+
+os.makedirs(BACKUPS_DIR, exist_ok=True)
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+try:
+    os.chmod(STORAGE_DIR, 0o777)
+    os.chmod(UPLOADS_DIR, 0o777)
+    os.chmod(BACKUPS_DIR, 0o777)
+except Exception:
+    pass
+
+HF_SYNC_LOCK = asyncio.Lock()
+HF_DIRTY = False
+
+def get_hf_cmd() -> str:
+    if shutil.which("hf"):
+        return "hf"
+    local_hf = os.path.expanduser("~/.local/bin/hf")
+    if os.path.isfile(local_hf):
+        return local_hf
+    if os.path.isfile("/usr/local/bin/hf"):
+        return "/usr/local/bin/hf"
+    return "hf"
+
+async def run_hf_sync(direction: str):
+    if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        return
+    env = os.environ.copy()
+    env["HF_TOKEN"] = HF_TOKEN
+    hf_bin = get_hf_cmd()
+
+    if direction == "pull":
+        cmd = [hf_bin, "sync", f"hf://buckets/{BUCKET_NAME}", STORAGE_DIR]
+    else:
+        cmd = [hf_bin, "sync", STORAGE_DIR, f"hf://buckets/{BUCKET_NAME}"]
+
     try:
-        api = HfApi(token=HF_TOKEN)
-        api.create_repo(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, private=True, exist_ok=True)
+        async with HF_SYNC_LOCK:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                print(f"HF Sync ({direction}) success")
+            else:
+                print(f"HF Sync ({direction}) error: {stderr.decode()}")
     except Exception as e:
-        print(f"HfApi init failed: {e}")
-        api = None
+        print(f"HF CLI execution error: {e}")
+
+async def hf_sync_worker():
+    global HF_DIRTY
+    while True:
+        await asyncio.sleep(30)
+        if HF_DIRTY:
+            await run_hf_sync("push")
+            HF_DIRTY = False
 
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
@@ -44,88 +100,9 @@ def check_nsfw_image(file_path: str) -> bool:
         return False
     return False
 
-HF_DB_DIRTY = False
-HF_RULES_DIRTY = False
-
-async def hf_sync_worker():
-    global HF_DB_DIRTY, HF_RULES_DIRTY
-    while True:
-        await asyncio.sleep(30)
-        if api and HF_REPO_ID:
-            if HF_DB_DIRTY and os.path.exists(DB_FILE):
-                try:
-                    await asyncio.to_thread(
-                        api.upload_file,
-                        path_or_fileobj=DB_FILE,
-                        path_in_repo="db.json",
-                        repo_id=HF_REPO_ID,
-                        repo_type=HF_REPO_TYPE
-                    )
-                    HF_DB_DIRTY = False
-                    print("Synced db.json to Hugging Face successfully!")
-                except Exception as e:
-                    print(f"Sync db.json failed: {e}")
-
-            if HF_RULES_DIRTY and os.path.exists(RULES_FILE):
-                try:
-                    await asyncio.to_thread(
-                        api.upload_file,
-                        path_or_fileobj=RULES_FILE,
-                        path_in_repo="rules.json",
-                        repo_id=HF_REPO_ID,
-                        repo_type=HF_REPO_TYPE
-                    )
-                    HF_RULES_DIRTY = False
-                    print("Synced rules.json to Hugging Face successfully!")
-                except Exception as e:
-                    print(f"Sync rules.json failed: {e}")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if api and HF_REPO_ID:
-        try:
-            downloaded_db = await asyncio.to_thread(
-                api.hf_hub_download,
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE,
-                filename="db.json"
-            )
-            shutil.copy(downloaded_db, DB_FILE)
-            print("Loaded db.json from Hugging Face.")
-        except Exception as e:
-            print(f"Fetch db.json error: {e}")
-
-        try:
-            downloaded_rules = await asyncio.to_thread(
-                api.hf_hub_download,
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE,
-                filename="rules.json"
-            )
-            shutil.copy(downloaded_rules, RULES_FILE)
-            print("Loaded rules.json from Hugging Face.")
-        except Exception as e:
-            print(f"Fetch rules.json error: {e}")
-
-        try:
-            repo_files = await asyncio.to_thread(
-                api.list_repo_files,
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE
-            )
-            for rfile in repo_files:
-                if rfile.startswith("backups/") and rfile.endswith(".json"):
-                    dest = os.path.join(BACKUPS_DIR, os.path.basename(rfile))
-                    downloaded_backup = await asyncio.to_thread(
-                        api.hf_hub_download,
-                        repo_id=HF_REPO_ID,
-                        repo_type=HF_REPO_TYPE,
-                        filename=rfile
-                    )
-                    shutil.copy(downloaded_backup, dest)
-        except Exception as e:
-            print(f"Fetch backups error: {e}")
-
+    await run_hf_sync("pull")
     load_rules()
     load_database()
     load_metrics()
@@ -139,16 +116,8 @@ async def lifespan(app: FastAPI):
         hf_task.cancel()
         if METRICS_DIRTY:
             await asyncio.to_thread(save_metrics)
-        if HF_DB_DIRTY and api and os.path.exists(DB_FILE):
-            try:
-                api.upload_file(
-                    path_or_fileobj=DB_FILE,
-                    path_in_repo="db.json",
-                    repo_id=HF_REPO_ID,
-                    repo_type=HF_REPO_TYPE
-                )
-            except Exception:
-                pass
+        if HF_DIRTY:
+            await run_hf_sync("push")
 
 app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
@@ -169,23 +138,6 @@ subscriptions: Dict[str, List[WebSocket]] = {}
 active_websockets = set()
 STORAGE_BYTES = 0
 METRICS_DIRTY = False
-
-STORAGE_DIR = os.getenv("STORAGE_DIR", "/data")
-RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
-DB_FILE = os.path.join(STORAGE_DIR, "db.json")
-METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
-BACKUPS_DIR = os.path.join(STORAGE_DIR, "backups")
-UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
-
-os.makedirs(BACKUPS_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-
-try:
-    os.chmod(STORAGE_DIR, 0o777)
-    os.chmod(UPLOADS_DIR, 0o777)
-    os.chmod(BACKUPS_DIR, 0o777)
-except Exception:
-    pass
 
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
@@ -353,9 +305,6 @@ async def metrics_flusher():
             await asyncio.to_thread(save_metrics)
             METRICS_DIRTY = False
 
-load_rules()
-load_database()
-load_metrics()
 STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
 
 @app.middleware("http")
@@ -379,20 +328,20 @@ async def bandwidth_tracker(request: Request, call_next):
     return response
 
 def _write_db_sync():
-    global STORAGE_BYTES, HF_DB_DIRTY
+    global STORAGE_BYTES, HF_DIRTY
     data_str = json.dumps(DATABASE, indent=2)
     _atomic_write_text(DB_FILE, data_str)
     STORAGE_BYTES = len(data_str.encode("utf-8"))
-    HF_DB_DIRTY = True
+    HF_DIRTY = True
 
 async def save_db():
     await asyncio.to_thread(_write_db_sync)
     sync_metrics()
 
 def _write_rules_sync():
-    global HF_RULES_DIRTY
+    global HF_DIRTY
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
-    HF_RULES_DIRTY = True
+    HF_DIRTY = True
 
 async def save_rules_file():
     await asyncio.to_thread(_write_rules_sync)
@@ -857,7 +806,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -1226,23 +1175,14 @@ async def serve_upload_file(filename: str):
     clean_name = os.path.basename(filename)
     fpath = os.path.join(UPLOADS_DIR, clean_name)
     if not os.path.isfile(fpath):
-        if api and HF_REPO_ID:
-            try:
-                downloaded_file = await asyncio.to_thread(
-                    api.hf_hub_download,
-                    repo_id=HF_REPO_ID,
-                    repo_type=HF_REPO_TYPE,
-                    filename=f"uploads/{clean_name}"
-                )
-                shutil.copy(downloaded_file, fpath)
-            except Exception:
-                pass
+        await run_hf_sync("pull")
     if os.path.isfile(fpath):
         return FileResponse(fpath)
     raise HTTPException(status_code=404, detail="File not found")
 
 @app.delete("/uploads/{filename:path}")
 async def delete_upload_file(filename: str):
+    global HF_DIRTY
     clean_name = os.path.basename(filename)
     fpath = os.path.join(UPLOADS_DIR, clean_name)
     if os.path.isfile(fpath):
@@ -1251,16 +1191,7 @@ async def delete_upload_file(filename: str):
         except Exception:
             pass
 
-    if api and HF_REPO_ID:
-        try:
-            await asyncio.to_thread(
-                api.delete_file,
-                path_in_repo=f"uploads/{clean_name}",
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE
-            )
-        except Exception:
-            pass
+    HF_DIRTY = True
 
     def remove_db_refs(node):
         changed = False
@@ -1296,6 +1227,7 @@ async def upload_media_file(
     target_path: str = Form("uploads"),
     is_public: str = Form("false"),
 ):
+    global HF_DIRTY
     push_id = generate_push_id()
     original_name = file.filename or "file"
     _, ext = os.path.splitext(original_name)
@@ -1330,23 +1262,13 @@ async def upload_media_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Explicit content is not allowed."
             )
-            
-    remote_upload_path = f"uploads/{saved_filename}"
-    if api and HF_REPO_ID:
-        try:
-            await asyncio.to_thread(
-                api.upload_file,
-                path_or_fileobj=dest_path,
-                path_in_repo=remote_upload_path,
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE
-            )
-            file_url = f"https://huggingface.co/{HF_REPO_TYPE}s/{HF_REPO_ID}/resolve/main/{remote_upload_path}"
-        except Exception as e:
-            print(f"HF Upload Error: {e}")
-            file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
-    else:
-        file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
+
+    HF_DIRTY = True
+
+    base_url = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else str(request.base_url).rstrip("/")
+    if base_url.startswith("http://") and ("hf.space" in base_url or "huggingface.co" in base_url):
+        base_url = "https://" + base_url[7:]
+    file_url = f"{base_url}/uploads/{saved_filename}"
         
     record = {
         "id": push_id,
@@ -1416,25 +1338,13 @@ async def list_backups():
 
 @app.post("/_admin/backups")
 async def make_backup():
+    global HF_DIRTY
     filename = f"backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     dest = _safe_backup_path(filename)
     async with db_lock:
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
-        
-    if api and HF_REPO_ID:
-        try:
-            await asyncio.to_thread(
-                api.upload_file,
-                path_or_fileobj=dest,
-                path_in_repo=f"backups/{filename}",
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE
-            )
-            print("Backup uploaded to Hugging Face successfully!")
-        except Exception as e:
-            print(f"HF Backup upload failed: {e}")
-            
+    HF_DIRTY = True
     return {"status": "created", "filename": filename}
 
 @app.post("/_admin/backups/restore/{filename}")
@@ -1463,20 +1373,11 @@ async def download_backup(filename: str):
 
 @app.delete("/_admin/backups/{filename}")
 async def delete_backup(filename: str):
+    global HF_DIRTY
     fp = _safe_backup_path(filename)
     if os.path.exists(fp):
         os.remove(fp)
-    if api and HF_REPO_ID:
-        try:
-            clean_name = os.path.basename(filename)
-            await asyncio.to_thread(
-                api.delete_file,
-                path_in_repo=f"backups/{clean_name}",
-                repo_id=HF_REPO_ID,
-                repo_type=HF_REPO_TYPE
-            )
-        except Exception:
-            pass
+    HF_DIRTY = True
     return {"status": "deleted"}
 
 @app.get("/api/usage")
