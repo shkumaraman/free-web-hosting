@@ -64,37 +64,20 @@ async def run_cloud_sync(direction: str):
 async def run_cloud_delete(relative_path: str):
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
-    env = os.environ.copy()
-    cmd_bin = get_cloud_cmd()
-    cmd = [cmd_bin, "rm", "--token", HF_TOKEN, f"hf://buckets/{BUCKET_NAME}/{relative_path}"]
 
-    async with CLOUD_SYNC_LOCK:
+    def _python_delete():
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await proc.communicate(input=b"y\n")
-            if proc.returncode == 0:
-                print(f"[Cloud Sync] (delete) success: {relative_path}")
-                return
-            else:
-                print(f"[Cloud Sync] (delete) CLI error: {stderr.decode().strip()}")
-        except Exception as e:
-            print(f"[Cloud Sync] Delete CLI execution error: {e}")
-        
-        def _python_delete():
+            from huggingface_hub import HfApi
+            api = HfApi(token=HF_TOKEN)
             try:
-                from huggingface_hub import HfApi
-                api = HfApi(token=HF_TOKEN)
                 api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="dataset")
-                print(f"[Cloud Sync] (delete) success via API fallback: {relative_path}")
             except Exception:
-                pass
-        await asyncio.to_thread(_python_delete)
+                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="model")
+            print(f"[Cloud Sync] (delete) success: {relative_path}")
+        except Exception as e:
+            print(f"[Cloud Sync] Delete API error for {relative_path}: {e}")
+            
+    await asyncio.to_thread(_python_delete)
 
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
@@ -1294,8 +1277,37 @@ async def upload_media_file(
                 detail="Explicit content is not allowed."
             )
             
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/uploads/{saved_filename}"
+    if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
+        def _upload_to_hf():
+            from huggingface_hub import HfApi
+            api = HfApi(token=HF_TOKEN)
+            try:
+                api.upload_file(
+                    path_or_fileobj=dest_path,
+                    path_in_repo=f"uploads/{saved_filename}",
+                    repo_id=BUCKET_NAME,
+                    repo_type="dataset"
+                )
+                return f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+            except Exception:
+                api.upload_file(
+                    path_or_fileobj=dest_path,
+                    path_in_repo=f"uploads/{saved_filename}",
+                    repo_id=BUCKET_NAME,
+                    repo_type="model"
+                )
+                return f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+        
+        try:
+            file_url = await asyncio.to_thread(_upload_to_hf)
+        except Exception as e:
+            print(f"[Cloud Sync] Direct upload error: {e}")
+            base_url = str(request.base_url).rstrip("/")
+            file_url = f"{base_url}/uploads/{saved_filename}"
+    else:
+        base_url = str(request.base_url).rstrip("/")
+        file_url = f"{base_url}/uploads/{saved_filename}"
+
     record = {
         "id": push_id,
         "name": original_name,
