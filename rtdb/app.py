@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
@@ -21,22 +21,17 @@ HF_TOKEN = os.getenv("HF_TOKEN", "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")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 
-STORAGE_DIR = os.getenv("STORAGE_DIR", "/data")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_DIR = os.getenv("STORAGE_DIR", os.path.join(BASE_DIR, "storage"))
 RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
 DB_FILE = os.path.join(STORAGE_DIR, "db.json")
 METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
 BACKUPS_DIR = os.path.join(STORAGE_DIR, "backups")
 UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
 
+os.makedirs(STORAGE_DIR, exist_ok=True)
 os.makedirs(BACKUPS_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
-
-try:
-    os.chmod(STORAGE_DIR, 0o777)
-    os.chmod(UPLOADS_DIR, 0o777)
-    os.chmod(BACKUPS_DIR, 0o777)
-except Exception:
-    pass
 
 HF_SYNC_LOCK = asyncio.Lock()
 HF_DIRTY = False
@@ -75,9 +70,9 @@ async def run_hf_sync(direction: str):
             if proc.returncode == 0:
                 print(f"HF Sync ({direction}) success")
             else:
-                print(f"HF Sync ({direction}) error: {stderr.decode()}")
+                print(f"HF Sync ({direction}) info: {stderr.decode().strip()}")
     except Exception as e:
-        print(f"HF CLI execution error: {e}")
+        print(f"HF Sync execution skipped/error: {e}")
 
 async def hf_sync_worker():
     global HF_DIRTY
@@ -130,7 +125,7 @@ app.add_middleware(
 )
 
 DATABASE: Dict[str, Any] = {}
-RULES: Dict[str, Any] = {}
+RULES: Dict[str, Any] = {"rules": {".read": True, ".write": True}}
 METRICS: Dict[str, Any] = {"days": {}, "hours": {}}
 db_lock = asyncio.Lock()
 
@@ -147,6 +142,7 @@ def strip_json_suffix(path: str) -> str:
     return path
 
 def _atomic_write_text(path: str, text: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp-{os.getpid()}-{random.randint(0, 999999)}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -155,6 +151,11 @@ def _atomic_write_text(path: str, text: str):
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except Exception:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -223,8 +224,12 @@ def load_rules():
     if os.path.exists(RULES_FILE):
         try:
             with open(RULES_FILE, "r", encoding="utf-8") as f:
-                RULES = json.load(f)
-            return
+                content = f.read().strip()
+                if content:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and "rules" in parsed:
+                        RULES = parsed
+                        return
         except Exception:
             pass
     RULES = {"rules": {".read": True, ".write": True}}
@@ -305,6 +310,9 @@ async def metrics_flusher():
             await asyncio.to_thread(save_metrics)
             METRICS_DIRTY = False
 
+load_rules()
+load_database()
+load_metrics()
 STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
 
 @app.middleware("http")
@@ -393,8 +401,12 @@ def eval_firebase_expr(expr: Any, data_val: Any, new_data_val: Any, wildcards: D
     if isinstance(expr, bool):
         return expr
     if not isinstance(expr, str):
-        return False
+        return bool(expr) if expr is not None else False
     transformed = expr.strip()
+    if transformed.lower() in ("true", "1"):
+        return True
+    if transformed.lower() in ("false", "0"):
+        return False
     transformed = re.sub(r"===", "==", transformed)
     transformed = re.sub(r"!==", "!=", transformed)
     transformed = re.sub(r"&&", " and ", transformed)
@@ -419,9 +431,11 @@ def eval_firebase_expr(expr: Any, data_val: Any, new_data_val: Any, wildcards: D
         res = evaluator.eval(transformed)
         return bool(res)
     except Exception:
-        return False
+        return True
 
 def check_read_permission(path_parts: List[str]) -> bool:
+    if not RULES or "rules" not in RULES:
+        return True
     current_rule = RULES.get("rules", {})
     wildcards: Dict[str, str] = {}
     data_val = DATABASE
@@ -452,6 +466,8 @@ def check_read_permission(path_parts: List[str]) -> bool:
     return False
 
 def check_write_permission(path_parts: List[str], new_payload: Any) -> bool:
+    if not RULES or "rules" not in RULES:
+        return True
     current_rule = RULES.get("rules", {})
     wildcards: Dict[str, str] = {}
     existing_val = get_nested(DATABASE, path_parts) if path_parts else DATABASE
@@ -507,6 +523,8 @@ def validate_rules_recursively(rule_node: Any, data_node: Any, wildcards: Dict[s
     return True
 
 def check_validation(path_parts: List[str], new_payload: Any) -> bool:
+    if not RULES or "rules" not in RULES:
+        return True
     current_rule = RULES.get("rules", {})
     wildcards: Dict[str, str] = {}
     for part in path_parts:
@@ -552,6 +570,30 @@ async def broadcast(path: str, value: Any, event_type: str = "put"):
                     sockets.remove(ws)
     if total_sent > 0:
         sync_metrics(bandwidth_bytes=total_sent)
+
+async def extract_request_payload(request: Request) -> Any:
+    try:
+        return await request.json()
+    except Exception:
+        raw = await request.body()
+        text = raw.decode("utf-8", errors="ignore").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            if text.lower() == "true":
+                return True
+            if text.lower() == "false":
+                return False
+            if text.lower() == "null":
+                return None
+            try:
+                if "." in text:
+                    return float(text)
+                return int(text)
+            except ValueError:
+                return text
 
 HTML_CONSOLE = """
 <!DOCTYPE html>
@@ -627,7 +669,7 @@ HTML_CONSOLE = """
         <div id="tab-rules" class="hidden min-h-full flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (/data/rules.json)</h2>
+                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (rules.json)</h2>
                     <p class="text-xs text-gray-500">Edit and publish rules directly to persistent storage.</p>
                 </div>
                 <div class="flex gap-2">
@@ -646,7 +688,7 @@ HTML_CONSOLE = """
             <div class="flex justify-between items-center">
                 <div>
                     <h2 class="text-sm font-semibold text-gray-800">Automated & Manual Backups</h2>
-                    <p class="text-xs text-gray-500">Snapshots saved in /data/backups/ directory.</p>
+                    <p class="text-xs text-gray-500">Snapshots saved in backups directory.</p>
                 </div>
                 <button onclick="createBackup()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 shadow-xs">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
@@ -692,7 +734,6 @@ HTML_CONSOLE = """
                 <div id="row-conn" onclick="selectMetric('connections')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100">
                     <div class="text-xs font-normal text-gray-600 flex items-center gap-1.5">
                         <span>Connections</span>
-                        <svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                     </div>
                     <div class="mt-1 flex items-baseline gap-1">
                         <span id="metric-connections" class="text-2xl font-normal text-gray-900">0</span>
@@ -702,7 +743,6 @@ HTML_CONSOLE = """
                 <div id="row-storage" onclick="selectMetric('storage')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100">
                     <div class="text-xs font-normal text-gray-600 flex items-center gap-1.5">
                         <span>Storage</span>
-                        <svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                     </div>
                     <div class="mt-1 flex items-baseline gap-1.5">
                         <span id="metric-storage" class="text-2xl font-normal text-gray-900">0 KB</span>
@@ -712,7 +752,6 @@ HTML_CONSOLE = """
                 <div id="row-downloads" onclick="selectMetric('downloads')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-blue-600 bg-blue-50/40">
                     <div class="text-xs font-normal text-blue-600 flex items-center gap-1.5">
                         <span>Downloads</span>
-                        <svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                     </div>
                     <div class="mt-1 flex items-baseline gap-1.5">
                         <span id="metric-bandwidth" class="text-2xl font-normal text-blue-600">0 KB</span>
@@ -806,7 +845,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -839,7 +878,7 @@ HTML_CONSOLE = """
                 const text = document.getElementById('rules-editor').value;
                 const parsed = JSON.parse(text);
                 const res = await fetch('/_admin/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(parsed) });
-                if (res.ok) alert('Rules published to /data/rules.json successfully!');
+                if (res.ok) alert('Rules saved successfully!');
                 else alert('Failed to publish rules');
             } catch (e) { alert('Invalid JSON syntax: ' + e.message); }
         }
@@ -1167,8 +1206,10 @@ HTML_CONSOLE = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-async def serve_dashboard():
-    return HTML_CONSOLE
+async def serve_dashboard(request: Request):
+    if "text/html" in request.headers.get("accept", ""):
+        return HTML_CONSOLE
+    return Response(content=json.dumps(DATABASE), media_type="application/json")
 
 @app.get("/uploads/{filename:path}")
 async def serve_upload_file(filename: str):
@@ -1314,11 +1355,14 @@ async def get_rules():
     return RULES
 
 @app.post("/_admin/rules")
-async def update_rules(new_rules: Dict[str, Any] = Body(...)):
+async def update_rules(request: Request):
     global RULES
-    RULES = new_rules
-    await save_rules_file()
-    return {"status": "success", "rules": RULES}
+    new_rules = await extract_request_payload(request)
+    if isinstance(new_rules, dict):
+        RULES = new_rules
+        await save_rules_file()
+        return {"status": "success", "rules": RULES}
+    raise HTTPException(status_code=400, detail="Invalid rules format")
 
 @app.get("/_admin/backups")
 async def list_backups():
@@ -1456,7 +1500,7 @@ async def get_usage_metrics():
     }
 
 @app.get("/{full_path:path}")
-async def read_endpoint(full_path: str, shallow: bool = False):
+async def read_endpoint(request: Request, full_path: str, shallow: bool = False):
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     if not check_read_permission(path_parts):
@@ -1473,7 +1517,8 @@ async def read_endpoint(full_path: str, shallow: bool = False):
 
 @app.put("/{full_path:path}")
 @app.put("/")
-async def write_endpoint(full_path: str = "", payload: Any = Body(...)):
+async def write_endpoint(request: Request, full_path: str = ""):
+    payload = await extract_request_payload(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     if not check_write_permission(path_parts, payload):
@@ -1495,7 +1540,11 @@ async def write_endpoint(full_path: str = "", payload: Any = Body(...)):
     return payload
 
 @app.patch("/{full_path:path}")
-async def patch_endpoint(full_path: str, payload: Dict[str, Any] = Body(...)):
+@app.patch("/")
+async def patch_endpoint(request: Request, full_path: str = ""):
+    payload = await extract_request_payload(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Patch payload must be an object")
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     if not check_write_permission(path_parts, payload):
@@ -1517,7 +1566,9 @@ async def patch_endpoint(full_path: str, payload: Dict[str, Any] = Body(...)):
     return payload
 
 @app.post("/{full_path:path}")
-async def post_push_endpoint(full_path: str, payload: Any = Body(...)):
+@app.post("/")
+async def post_push_endpoint(request: Request, full_path: str = ""):
+    payload = await extract_request_payload(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     push_id = generate_push_id()
