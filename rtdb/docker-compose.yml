@@ -1,0 +1,11 @@
+services:
+  realtime-db:
+    build: .
+    container_name: realtime-database
+    restart: always
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./db_data:/data
+    environment:
+      - STORAGE_DIR=/data
