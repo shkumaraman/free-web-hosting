@@ -10,8 +10,5 @@ services:
     environment:
       - STORAGE_DIR=/data
       - HF_TOKEN=${HF_TOKEN}
-      - HF_REPO_ID=${HF_REPO_ID}
-      - HF_REPO_TYPE=dataset
+      - BUCKET_NAME=plygram/backend
       - TF_CPP_MIN_LOG_LEVEL=2
-      - TF_USE_LEGACY_KERAS=1
-            
