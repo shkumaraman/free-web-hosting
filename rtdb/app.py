@@ -64,16 +64,14 @@ async def run_cloud_sync(direction: str):
 async def run_cloud_delete(relative_path: str):
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
-
     def _python_delete():
         try:
-            from huggingface_hub import HfApi
-            api = HfApi(token=HF_TOKEN)
-            try:
-                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="dataset")
-            except Exception:
-                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="model")
-            print(f"[Cloud Sync] (delete) success: {relative_path}")
+            from huggingface_hub import HfFileSystem
+            fs = HfFileSystem(token=HF_TOKEN)
+            target_path = f"hf://buckets/{BUCKET_NAME}/{relative_path}"
+            if fs.exists(target_path):
+                fs.rm(target_path)
+                print(f"[Cloud Sync] (delete) success: {relative_path}")
         except Exception as e:
             print(f"[Cloud Sync] Delete API error for {relative_path}: {e}")
             
@@ -90,34 +88,6 @@ def check_nsfw_image(file_path: str) -> bool:
     except Exception:
         return False
     return False
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("[Startup] Pulling data from Cloud Storage...")
-    await run_cloud_sync("pull")
-    flusher_task = asyncio.create_task(metrics_flusher())
-    try:
-        yield
-    finally:
-        flusher_task.cancel()
-        try:
-            await flusher_task
-        except asyncio.CancelledError:
-            pass
-        if METRICS_DIRTY:
-            await asyncio.to_thread(save_metrics)
-        print("[Shutdown] Pushing final data to Cloud Storage...")
-        await run_cloud_sync("push")
-
-app = FastAPI(title="Realtime Database", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 DATABASE: Dict[str, Any] = {}
 RULES: Dict[str, Any] = {}
@@ -313,10 +283,40 @@ async def metrics_flusher():
             await run_cloud_sync("push")
             METRICS_DIRTY = False
 
-load_rules()
-load_database()
-load_metrics()
-STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[Startup] Pulling data from Cloud Storage...")
+    await run_cloud_sync("pull")
+    
+    global STORAGE_BYTES
+    load_rules()
+    load_database()
+    load_metrics()
+    STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
+    
+    flusher_task = asyncio.create_task(metrics_flusher())
+    try:
+        yield
+    finally:
+        flusher_task.cancel()
+        try:
+            await flusher_task
+        except asyncio.CancelledError:
+            pass
+        if METRICS_DIRTY:
+            await asyncio.to_thread(save_metrics)
+        print("[Shutdown] Pushing final data to Cloud Storage...")
+        await run_cloud_sync("push")
+
+app = FastAPI(title="Realtime Database", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.middleware("http")
 async def bandwidth_tracker(request: Request, call_next):
@@ -819,7 +819,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -1277,37 +1277,8 @@ async def upload_media_file(
                 detail="Explicit content is not allowed."
             )
             
-    if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
-        def _upload_to_hf():
-            from huggingface_hub import HfApi
-            api = HfApi(token=HF_TOKEN)
-            try:
-                api.upload_file(
-                    path_or_fileobj=dest_path,
-                    path_in_repo=f"uploads/{saved_filename}",
-                    repo_id=BUCKET_NAME,
-                    repo_type="dataset"
-                )
-                return f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
-            except Exception:
-                api.upload_file(
-                    path_or_fileobj=dest_path,
-                    path_in_repo=f"uploads/{saved_filename}",
-                    repo_id=BUCKET_NAME,
-                    repo_type="model"
-                )
-                return f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
-        
-        try:
-            file_url = await asyncio.to_thread(_upload_to_hf)
-        except Exception as e:
-            print(f"[Cloud Sync] Direct upload error: {e}")
-            base_url = str(request.base_url).rstrip("/")
-            file_url = f"{base_url}/uploads/{saved_filename}"
-    else:
-        base_url = str(request.base_url).rstrip("/")
-        file_url = f"{base_url}/uploads/{saved_filename}"
-
+    base_url = str(request.base_url).rstrip("/")
+    file_url = f"{base_url}/uploads/{saved_filename}"
     record = {
         "id": push_id,
         "name": original_name,
