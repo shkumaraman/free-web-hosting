@@ -16,16 +16,20 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
-from huggingface_hub import HfFileSystem
+from huggingface_hub import HfApi
 
-HF_TOKEN = "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"
-BUCKET_NAME = "plygram/backend"
+HF_TOKEN = os.getenv("HF_TOKEN", "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")
+HF_REPO_ID = os.getenv("HF_REPO_ID", "plygram/backend")
+HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "dataset")
 
-try:
-    fs = HfFileSystem(token=HF_TOKEN) if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR") else None
-except Exception as e:
-    fs = None
-    print(f"HfFileSystem init failed: {e}")
+api = None
+if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
+    try:
+        api = HfApi(token=HF_TOKEN)
+        api.create_repo(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, private=True, exist_ok=True)
+    except Exception as e:
+        print(f"HfApi init failed: {e}")
+        api = None
 
 def check_nsfw_image(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
@@ -47,45 +51,80 @@ async def hf_sync_worker():
     global HF_DB_DIRTY, HF_RULES_DIRTY
     while True:
         await asyncio.sleep(30)
-        if fs and BUCKET_NAME:
-            try:
-                if HF_DB_DIRTY:
-                    remote_db = f"hf://buckets/{BUCKET_NAME}/db.json"
-                    await asyncio.to_thread(fs.put_file, DB_FILE, remote_db)
+        if api and HF_REPO_ID:
+            if HF_DB_DIRTY and os.path.exists(DB_FILE):
+                try:
+                    await asyncio.to_thread(
+                        api.upload_file,
+                        path_or_fileobj=DB_FILE,
+                        path_in_repo="db.json",
+                        repo_id=HF_REPO_ID,
+                        repo_type=HF_REPO_TYPE
+                    )
                     HF_DB_DIRTY = False
-                    print("Synced db.json to Hugging Face Bucket successfully!")
-                if HF_RULES_DIRTY:
-                    remote_rules = f"hf://buckets/{BUCKET_NAME}/rules.json"
-                    await asyncio.to_thread(fs.put_file, RULES_FILE, remote_rules)
+                    print("Synced db.json to Hugging Face successfully!")
+                except Exception as e:
+                    print(f"Sync db.json failed: {e}")
+
+            if HF_RULES_DIRTY and os.path.exists(RULES_FILE):
+                try:
+                    await asyncio.to_thread(
+                        api.upload_file,
+                        path_or_fileobj=RULES_FILE,
+                        path_in_repo="rules.json",
+                        repo_id=HF_REPO_ID,
+                        repo_type=HF_REPO_TYPE
+                    )
                     HF_RULES_DIRTY = False
-                    print("Synced rules.json to Hugging Face Bucket successfully!")
-            except Exception as e:
-                print(f"HF Bucket Sync Error: {e}")
+                    print("Synced rules.json to Hugging Face successfully!")
+                except Exception as e:
+                    print(f"Sync rules.json failed: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if fs and BUCKET_NAME:
+    if api and HF_REPO_ID:
         try:
-            remote_db = f"hf://buckets/{BUCKET_NAME}/db.json"
-            if await asyncio.to_thread(fs.exists, remote_db):
-                await asyncio.to_thread(fs.get_file, remote_db, DB_FILE)
-                print("Loaded db.json from Hugging Face Bucket.")
-
-            remote_rules = f"hf://buckets/{BUCKET_NAME}/rules.json"
-            if await asyncio.to_thread(fs.exists, remote_rules):
-                await asyncio.to_thread(fs.get_file, remote_rules, RULES_FILE)
-                print("Loaded rules.json from Hugging Face Bucket.")
-
-            remote_backups_dir = f"hf://buckets/{BUCKET_NAME}/backups"
-            if await asyncio.to_thread(fs.exists, remote_backups_dir):
-                backup_files = await asyncio.to_thread(fs.ls, remote_backups_dir, detail=False)
-                for bf in backup_files:
-                    if bf.endswith(".json"):
-                        fname = os.path.basename(bf)
-                        dest = os.path.join(BACKUPS_DIR, fname)
-                        await asyncio.to_thread(fs.get_file, bf, dest)
+            downloaded_db = await asyncio.to_thread(
+                api.hf_hub_download,
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE,
+                filename="db.json"
+            )
+            shutil.copy(downloaded_db, DB_FILE)
+            print("Loaded db.json from Hugging Face.")
         except Exception as e:
-            print(f"Bucket Startup Fetch Error: {e}")
+            print(f"Fetch db.json error: {e}")
+
+        try:
+            downloaded_rules = await asyncio.to_thread(
+                api.hf_hub_download,
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE,
+                filename="rules.json"
+            )
+            shutil.copy(downloaded_rules, RULES_FILE)
+            print("Loaded rules.json from Hugging Face.")
+        except Exception as e:
+            print(f"Fetch rules.json error: {e}")
+
+        try:
+            repo_files = await asyncio.to_thread(
+                api.list_repo_files,
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE
+            )
+            for rfile in repo_files:
+                if rfile.startswith("backups/") and rfile.endswith(".json"):
+                    dest = os.path.join(BACKUPS_DIR, os.path.basename(rfile))
+                    downloaded_backup = await asyncio.to_thread(
+                        api.hf_hub_download,
+                        repo_id=HF_REPO_ID,
+                        repo_type=HF_REPO_TYPE,
+                        filename=rfile
+                    )
+                    shutil.copy(downloaded_backup, dest)
+        except Exception as e:
+            print(f"Fetch backups error: {e}")
 
     load_rules()
     load_database()
@@ -100,9 +139,14 @@ async def lifespan(app: FastAPI):
         hf_task.cancel()
         if METRICS_DIRTY:
             await asyncio.to_thread(save_metrics)
-        if HF_DB_DIRTY and fs:
+        if HF_DB_DIRTY and api and os.path.exists(DB_FILE):
             try:
-                fs.put_file(DB_FILE, f"hf://buckets/{BUCKET_NAME}/db.json")
+                api.upload_file(
+                    path_or_fileobj=DB_FILE,
+                    path_in_repo="db.json",
+                    repo_id=HF_REPO_ID,
+                    repo_type=HF_REPO_TYPE
+                )
             except Exception:
                 pass
 
@@ -1182,11 +1226,15 @@ async def serve_upload_file(filename: str):
     clean_name = os.path.basename(filename)
     fpath = os.path.join(UPLOADS_DIR, clean_name)
     if not os.path.isfile(fpath):
-        if fs and BUCKET_NAME:
-            remote_file = f"hf://buckets/{BUCKET_NAME}/uploads/{clean_name}"
+        if api and HF_REPO_ID:
             try:
-                if await asyncio.to_thread(fs.exists, remote_file):
-                    await asyncio.to_thread(fs.get_file, remote_file, fpath)
+                downloaded_file = await asyncio.to_thread(
+                    api.hf_hub_download,
+                    repo_id=HF_REPO_ID,
+                    repo_type=HF_REPO_TYPE,
+                    filename=f"uploads/{clean_name}"
+                )
+                shutil.copy(downloaded_file, fpath)
             except Exception:
                 pass
     if os.path.isfile(fpath):
@@ -1203,11 +1251,14 @@ async def delete_upload_file(filename: str):
         except Exception:
             pass
 
-    if fs and BUCKET_NAME:
+    if api and HF_REPO_ID:
         try:
-            remote_file = f"hf://buckets/{BUCKET_NAME}/uploads/{clean_name}"
-            if await asyncio.to_thread(fs.exists, remote_file):
-                await asyncio.to_thread(fs.rm, remote_file)
+            await asyncio.to_thread(
+                api.delete_file,
+                path_in_repo=f"uploads/{clean_name}",
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE
+            )
         except Exception:
             pass
 
@@ -1280,13 +1331,19 @@ async def upload_media_file(
                 detail="Explicit content is not allowed."
             )
             
-    if fs and BUCKET_NAME:
+    remote_upload_path = f"uploads/{saved_filename}"
+    if api and HF_REPO_ID:
         try:
-            remote_upload_path = f"hf://buckets/{BUCKET_NAME}/uploads/{saved_filename}"
-            await asyncio.to_thread(fs.put_file, dest_path, remote_upload_path)
-            file_url = f"https://huggingface.co/buckets/{BUCKET_NAME}/raw/uploads/{saved_filename}"
+            await asyncio.to_thread(
+                api.upload_file,
+                path_or_fileobj=dest_path,
+                path_in_repo=remote_upload_path,
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE
+            )
+            file_url = f"https://huggingface.co/{HF_REPO_TYPE}s/{HF_REPO_ID}/resolve/main/{remote_upload_path}"
         except Exception as e:
-            print(f"HF Bucket Upload Error: {e}")
+            print(f"HF Upload Error: {e}")
             file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
     else:
         file_url = f"{str(request.base_url).rstrip('/')}/uploads/{saved_filename}"
@@ -1365,11 +1422,16 @@ async def make_backup():
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
         
-    if fs and BUCKET_NAME:
+    if api and HF_REPO_ID:
         try:
-            remote_backup = f"hf://buckets/{BUCKET_NAME}/backups/{filename}"
-            await asyncio.to_thread(fs.put_file, dest, remote_backup)
-            print("Backup uploaded to Hugging Face Bucket successfully!")
+            await asyncio.to_thread(
+                api.upload_file,
+                path_or_fileobj=dest,
+                path_in_repo=f"backups/{filename}",
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE
+            )
+            print("Backup uploaded to Hugging Face successfully!")
         except Exception as e:
             print(f"HF Backup upload failed: {e}")
             
@@ -1404,12 +1466,15 @@ async def delete_backup(filename: str):
     fp = _safe_backup_path(filename)
     if os.path.exists(fp):
         os.remove(fp)
-    if fs and BUCKET_NAME:
+    if api and HF_REPO_ID:
         try:
             clean_name = os.path.basename(filename)
-            remote_backup = f"hf://buckets/{BUCKET_NAME}/backups/{clean_name}"
-            if await asyncio.to_thread(fs.exists, remote_backup):
-                await asyncio.to_thread(fs.rm, remote_backup)
+            await asyncio.to_thread(
+                api.delete_file,
+                path_in_repo=f"backups/{clean_name}",
+                repo_id=HF_REPO_ID,
+                repo_type=HF_REPO_TYPE
+            )
         except Exception:
             pass
     return {"status": "deleted"}
