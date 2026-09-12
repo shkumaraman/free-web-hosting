@@ -4,3 +4,6 @@ python-multipart
 Pillow
 simpleeval
 opennsfw2
+tf-keras
+tensorflow-cpu
+huggingface_hub
