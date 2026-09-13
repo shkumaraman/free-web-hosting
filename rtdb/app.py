@@ -760,7 +760,7 @@ HTML_CONSOLE = """
         <div id="tab-rules" class="hidden min-h-full flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (rules.json)</h2>
+                    <h2 class="text-sm font-semibold text-gray-800">Security Rules</h2>
                     <p class="text-xs text-gray-500">Edit and publish rules directly to persistent storage.</p>
                 </div>
                 <div class="flex gap-2">
