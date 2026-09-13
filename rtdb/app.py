@@ -29,23 +29,22 @@ async def pull_state_from_cloud():
         return
     def _pull():
         try:
-            from huggingface_hub import HfFileSystem
-            fs = HfFileSystem(token=HF_TOKEN)
+            from huggingface_hub import snapshot_download, HfApi
+            api = HfApi(token=HF_TOKEN)
             try:
-                fs.ls(f"hf://datasets/{BUCKET_NAME}")
-                base_path = f"hf://datasets/{BUCKET_NAME}"
+                api.dataset_info(BUCKET_NAME)
+                repo_type = "dataset"
             except Exception:
-                base_path = f"hf://{BUCKET_NAME}"
+                repo_type = "model"
             
-            for fname in ["db.json", "rules.json", "metrics.json"]:
-                rem = f"{base_path}/{fname}"
-                loc = os.path.join(STORAGE_DIR, fname)
-                if fs.exists(rem):
-                    fs.get(rem, loc)
-            
-            rem_backups = f"{base_path}/backups"
-            if fs.exists(rem_backups):
-                fs.get(rem_backups, BACKUPS_DIR, recursive=True)
+            snapshot_download(
+                repo_id=BUCKET_NAME,
+                repo_type=repo_type,
+                local_dir=STORAGE_DIR,
+                ignore_patterns=["uploads/*"],
+                token=HF_TOKEN
+            )
+            print("[Cloud Sync] Pull success (excluding uploads)")
         except Exception as e:
             print(f"[Cloud Sync] Pull error: {e}")
     await asyncio.to_thread(_pull)
@@ -82,13 +81,13 @@ async def run_cloud_delete(relative_path: str):
         return
     def _python_delete():
         try:
-            from huggingface_hub import HfFileSystem
-            fs = HfFileSystem(token=HF_TOKEN)
-            target_path = f"hf://datasets/{BUCKET_NAME}/{relative_path}"
-            if not fs.exists(target_path):
-                target_path = f"hf://{BUCKET_NAME}/{relative_path}"
-            if fs.exists(target_path):
-                fs.rm(target_path)
+            from huggingface_hub import HfApi
+            api = HfApi(token=HF_TOKEN)
+            try:
+                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="dataset")
+            except Exception:
+                api.delete_file(path_in_repo=relative_path, repo_id=BUCKET_NAME, repo_type="model")
+            print(f"[Cloud Sync] (delete) success: {relative_path}")
         except Exception as e:
             print(f"[Cloud Sync] Delete API error for {relative_path}: {e}")
     await asyncio.to_thread(_python_delete)
@@ -231,7 +230,11 @@ def load_database():
                 content = f.read().strip()
                 if content:
                     DATABASE.clear()
-                    DATABASE.update(json.loads(content))
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        DATABASE.update(parsed)
+                    else:
+                        DATABASE["data"] = parsed
         except Exception:
             DATABASE.clear()
 
@@ -825,7 +828,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
