@@ -203,7 +203,8 @@ def _atomic_write_text(path: str, text: str):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
-    except Exception:
+    except Exception as e:
+        print(f"[Atomic Write Error] {e}")
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -213,9 +214,9 @@ def _atomic_write_text(path: str, text: str):
 
 def _safe_backup_path(filename: str) -> str:
     clean_name = os.path.basename(filename)
-    full_path = os.path.normpath(os.path.join(BACKUPS_DIR, clean_name))
     backups_abs = os.path.abspath(BACKUPS_DIR)
-    if full_path != backups_abs and not full_path.startswith(backups_abs + os.sep):
+    full_path = os.path.abspath(os.path.join(backups_abs, clean_name))
+    if not full_path.startswith(backups_abs + os.sep):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
     return full_path
 
@@ -1000,20 +1001,34 @@ HTML_CONSOLE = """
 
         async function createBackup() {
             const res = await fetch('/_admin/backups', { method: 'POST' });
-            if (res.ok) { loadBackups(); }
+            if (res.ok) {
+                loadBackups();
+            } else {
+                const err = await res.json().catch(() => ({}));
+                alert('Failed to create backup: ' + (err.detail || 'Error'));
+            }
         }
 
         async function restoreBackup(filename) {
             if (confirm(`Restore ${filename}? This will overwrite current database.`)) {
                 const res = await fetch(`/_admin/backups/restore/${filename}`, { method: 'POST' });
-                if (res.ok) { refreshData(); }
+                if (res.ok) {
+                    refreshData();
+                    alert('Backup restored successfully!');
+                } else {
+                    alert('Failed to restore backup');
+                }
             }
         }
 
         async function deleteBackup(filename) {
             if (confirm(`Delete backup ${filename}?`)) {
-                await fetch(`/_admin/backups/${filename}`, { method: 'DELETE' });
-                loadBackups();
+                const res = await fetch(`/_admin/backups/${filename}`, { method: 'DELETE' });
+                if (res.ok) {
+                    loadBackups();
+                } else {
+                    alert('Failed to delete backup');
+                }
             }
         }
 
@@ -1521,19 +1536,48 @@ async def update_rules(new_rules: Dict[str, Any] = Body(...)):
 
 @app.get("/_admin/backups")
 async def list_backups():
-    files = []
-    for f in sorted(os.listdir(BACKUPS_DIR), reverse=True):
-        if f.endswith(".json"):
-            fp = os.path.join(BACKUPS_DIR, f)
-            stat = os.stat(fp)
-            files.append(
-                {
+    files_map = {}
+    if os.path.isdir(BACKUPS_DIR):
+        for f in os.listdir(BACKUPS_DIR):
+            if f.endswith(".json"):
+                fp = os.path.join(BACKUPS_DIR, f)
+                stat = os.stat(fp)
+                files_map[f] = {
                     "filename": f,
                     "date": datetime.fromtimestamp(stat.st_mtime, timezone.utc).strftime("%b %d, %Y %I:%M %p"),
                     "size": stat.st_size,
                 }
-            )
-    return files
+
+    def _fetch_remote():
+        fs = get_hf_fs()
+        if not fs:
+            return []
+        remote_backups = f"hf://buckets/{BUCKET_NAME}/backups"
+        try:
+            if fs.exists(remote_backups):
+                items = fs.ls(remote_backups, detail=True)
+                res = []
+                for it in items:
+                    name = os.path.basename(it.get("name", ""))
+                    if name.endswith(".json"):
+                        size = it.get("size", 0)
+                        mtime = it.get("last_modified")
+                        if isinstance(mtime, datetime):
+                            d_str = mtime.strftime("%b %d, %Y %I:%M %p")
+                        else:
+                            d_str = datetime.now(timezone.utc).strftime("%b %d, %Y %I:%M %p")
+                        res.append({"filename": name, "date": d_str, "size": size})
+                return res
+        except Exception as e:
+            print(f"[Cloud Backup List Error] {e}")
+        return []
+
+    remote_items = await asyncio.to_thread(_fetch_remote)
+    for item in remote_items:
+        if item["filename"] not in files_map:
+            files_map[item["filename"]] = item
+
+    return sorted(list(files_map.values()), key=lambda x: x["filename"], reverse=True)
 
 
 @app.post("/_admin/backups")
@@ -1544,13 +1588,28 @@ async def make_backup():
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
 
-    await run_state_sync("push")
+    pushed = await push_single_file_to_hf(dest, f"backups/{filename}")
+    if not pushed:
+        asyncio.create_task(run_state_sync("push"))
+
     return {"status": "created", "filename": filename}
 
 
 @app.post("/_admin/backups/restore/{filename}")
 async def restore_backup(filename: str):
     src = _safe_backup_path(filename)
+    if not os.path.exists(src):
+        def _fetch_backup():
+            fs = get_hf_fs()
+            if fs:
+                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{filename}"
+                try:
+                    if fs.exists(remote_path):
+                        fs.get_file(remote_path, src)
+                except Exception as e:
+                    print(f"[Cloud Backup Restore Error] {e}")
+        await asyncio.to_thread(_fetch_backup)
+
     if not os.path.exists(src):
         raise HTTPException(status_code=404, detail="Backup file not found")
 
@@ -1572,6 +1631,18 @@ async def restore_backup(filename: str):
 async def download_backup(filename: str):
     fp = _safe_backup_path(filename)
     if not os.path.exists(fp):
+        def _fetch_backup():
+            fs = get_hf_fs()
+            if fs:
+                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{filename}"
+                try:
+                    if fs.exists(remote_path):
+                        fs.get_file(remote_path, fp)
+                except Exception as e:
+                    print(f"[Cloud Backup Download Error] {e}")
+        await asyncio.to_thread(_fetch_backup)
+
+    if not os.path.exists(fp):
         raise HTTPException(status_code=404, detail="Backup file not found")
     return FileResponse(fp, media_type="application/json", filename=os.path.basename(fp))
 
@@ -1580,7 +1651,10 @@ async def download_backup(filename: str):
 async def delete_backup(filename: str):
     fp = _safe_backup_path(filename)
     if os.path.exists(fp):
-        os.remove(fp)
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
 
     asyncio.create_task(run_cloud_delete(f"backups/{filename}"))
     return {"status": "deleted"}
