@@ -5,16 +5,16 @@ import json
 import os
 import random
 import re
-import shutil
 import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import requests
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from PIL import Image
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
@@ -24,58 +24,73 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 CLOUD_SYNC_LOCK = asyncio.Lock()
 
-def get_cloud_cmd() -> str:
-    if shutil.which("hf"):
-        return "hf"
-    local_hf = os.path.expanduser("~/.local/bin/hf")
-    if os.path.isfile(local_hf):
-        return local_hf
-    if os.path.isfile("/usr/local/bin/hf"):
-        return "/usr/local/bin/hf"
-    return "hf"
-
-async def run_cloud_sync(direction: str):
+async def pull_state_from_cloud():
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
-    env = os.environ.copy()
-    cmd_bin = get_cloud_cmd()
+    def _pull():
+        try:
+            from huggingface_hub import HfFileSystem
+            fs = HfFileSystem(token=HF_TOKEN)
+            try:
+                fs.ls(f"hf://datasets/{BUCKET_NAME}")
+                base_path = f"hf://datasets/{BUCKET_NAME}"
+            except Exception:
+                base_path = f"hf://{BUCKET_NAME}"
+            
+            for fname in ["db.json", "rules.json", "metrics.json"]:
+                rem = f"{base_path}/{fname}"
+                loc = os.path.join(STORAGE_DIR, fname)
+                if fs.exists(rem):
+                    fs.get(rem, loc)
+            
+            rem_backups = f"{base_path}/backups"
+            if fs.exists(rem_backups):
+                fs.get(rem_backups, BACKUPS_DIR, recursive=True)
+        except Exception as e:
+            print(f"[Cloud Sync] Pull error: {e}")
+    await asyncio.to_thread(_pull)
 
-    if direction == "pull":
-        cmd = [cmd_bin, "sync", "--token", HF_TOKEN, f"hf://buckets/{BUCKET_NAME}", STORAGE_DIR]
-    else:
-        cmd = [cmd_bin, "sync", "--token", HF_TOKEN, STORAGE_DIR, f"hf://buckets/{BUCKET_NAME}"]
-
-    try:
-        async with CLOUD_SYNC_LOCK:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0:
-                print(f"[Cloud Sync] ({direction}) success")
-            else:
-                print(f"[Cloud Sync] ({direction}) error: {stderr.decode().strip()}")
-    except Exception as e:
-        print(f"[Cloud Sync] Execution error: {e}")
+async def push_state_to_cloud(filename: str = None):
+    if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        return
+    def _push():
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=HF_TOKEN)
+            try:
+                api.dataset_info(BUCKET_NAME)
+                repo_type = "dataset"
+            except Exception:
+                repo_type = "model"
+            
+            files_to_push = [filename] if filename else ["db.json", "rules.json", "metrics.json"]
+            for fname in files_to_push:
+                local_p = os.path.join(STORAGE_DIR, fname)
+                if os.path.isfile(local_p):
+                    api.upload_file(
+                        path_or_fileobj=local_p,
+                        path_in_repo=fname,
+                        repo_id=BUCKET_NAME,
+                        repo_type=repo_type
+                    )
+        except Exception as e:
+            print(f"[Cloud Sync] Push error: {e}")
+    await asyncio.to_thread(_push)
 
 async def run_cloud_delete(relative_path: str):
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
-
     def _python_delete():
         try:
             from huggingface_hub import HfFileSystem
             fs = HfFileSystem(token=HF_TOKEN)
-            target_path = f"hf://buckets/{BUCKET_NAME}/{relative_path}"
+            target_path = f"hf://datasets/{BUCKET_NAME}/{relative_path}"
+            if not fs.exists(target_path):
+                target_path = f"hf://{BUCKET_NAME}/{relative_path}"
             if fs.exists(target_path):
                 fs.rm(target_path)
-                print(f"[Cloud Sync] (delete) success: {relative_path}")
         except Exception as e:
             print(f"[Cloud Sync] Delete API error for {relative_path}: {e}")
-            
     await asyncio.to_thread(_python_delete)
 
 def check_nsfw_image(file_path: str) -> bool:
@@ -282,13 +297,12 @@ async def metrics_flusher():
         await asyncio.sleep(20)
         if METRICS_DIRTY:
             await asyncio.to_thread(save_metrics)
-            await run_cloud_sync("push")
+            await push_state_to_cloud("metrics.json")
             METRICS_DIRTY = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Startup] Pulling data from Cloud Storage...")
-    await run_cloud_sync("pull")
+    await pull_state_from_cloud()
     
     global STORAGE_BYTES
     load_rules()
@@ -307,8 +321,7 @@ async def lifespan(app: FastAPI):
             pass
         if METRICS_DIRTY:
             await asyncio.to_thread(save_metrics)
-        print("[Shutdown] Pushing final data to Cloud Storage...")
-        await run_cloud_sync("push")
+        await push_state_to_cloud()
 
 app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
@@ -342,14 +355,14 @@ def _write_db_sync():
 async def save_db():
     await asyncio.to_thread(_write_db_sync)
     sync_metrics()
-    asyncio.create_task(run_cloud_sync("push"))
+    asyncio.create_task(push_state_to_cloud("db.json"))
 
 def _write_rules_sync():
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
 
 async def save_rules_file():
     await asyncio.to_thread(_write_rules_sync)
-    asyncio.create_task(run_cloud_sync("push"))
+    asyncio.create_task(push_state_to_cloud("rules.json"))
 
 def get_nested(data: dict, path_parts: List[str]) -> Any:
     current = data
@@ -384,10 +397,10 @@ def remove_associated_files(node: Any) -> List[str]:
         if "filename" in node and isinstance(node["filename"], str):
             fname = os.path.basename(node["filename"])
             fpath = os.path.join(UPLOADS_DIR, fname)
+            deleted_paths.append(f"uploads/{fname}")
             if os.path.isfile(fpath):
                 try:
                     os.remove(fpath)
-                    deleted_paths.append(f"uploads/{fname}")
                 except Exception:
                     pass
         for val in node.values():
@@ -1107,7 +1120,7 @@ HTML_CONSOLE = """
             } else {
                 document.getElementById('modal-heading').innerText = 'Edit Value';
                 keyGroup.style.display = 'none';
-                document.getElementById('input-val').value = JSON.stringify(currentVal);
+                document.getElementById('input-val').value = typeof currentVal === 'string' ? JSON.stringify(currentVal) : JSON.stringify(currentVal);
             }
             document.getElementById('node-modal').classList.remove('hidden');
             document.getElementById('node-modal').classList.add('flex');
@@ -1188,17 +1201,37 @@ async def serve_dashboard():
 @app.get("/uploads/{filename:path}")
 async def serve_upload_file(filename: str):
     clean_name = os.path.basename(filename)
-    fpath = os.path.join(UPLOADS_DIR, clean_name)
-    if not os.path.isfile(fpath):
-        await run_cloud_sync("pull")
-    if os.path.isfile(fpath):
-        return FileResponse(fpath)
-    raise HTTPException(status_code=404, detail="File not found")
+    local_path = os.path.join(UPLOADS_DIR, clean_name)
+    
+    if os.path.isfile(local_path):
+        return FileResponse(local_path)
+        
+    def _stream_from_hf():
+        hf_url = f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{clean_name}"
+        resp = requests.get(hf_url, stream=True)
+        if resp.status_code != 200:
+            hf_url = f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{clean_name}"
+            resp = requests.get(hf_url, stream=True)
+        if resp.status_code == 200:
+            return resp
+        return None
+        
+    resp = await asyncio.to_thread(_stream_from_hf)
+    if not resp:
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    def generate():
+        for chunk in resp.iter_content(chunk_size=8192):
+            yield chunk
+        resp.close()
+        
+    return StreamingResponse(generate(), media_type=resp.headers.get("Content-Type", "application/octet-stream"))
 
 @app.delete("/uploads/{filename:path}")
 async def delete_upload_file(filename: str):
     clean_name = os.path.basename(filename)
     fpath = os.path.join(UPLOADS_DIR, clean_name)
+    
     if os.path.isfile(fpath):
         try:
             os.remove(fpath)
@@ -1229,12 +1262,8 @@ async def delete_upload_file(filename: str):
         if db_changed:
             await save_db()
             await broadcast("", DATABASE, "put")
-    
-    async def _delete_task():
-        await run_cloud_delete(f"uploads/{clean_name}")
-        await run_cloud_sync("push")
-
-    asyncio.create_task(_delete_task())
+            
+    asyncio.create_task(run_cloud_delete(f"uploads/{clean_name}"))
     return {"status": "deleted", "filename": clean_name}
 
 @app.post("/api/upload")
@@ -1278,30 +1307,31 @@ async def upload_media_file(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Explicit content is not allowed."
             )
-            
+
     if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
         def _upload_to_hf():
             from huggingface_hub import HfApi
             api = HfApi(token=HF_TOKEN)
             try:
-                api.upload_file(
-                    path_or_fileobj=dest_path,
-                    path_in_repo=f"uploads/{saved_filename}",
-                    repo_id=BUCKET_NAME,
-                    repo_type="dataset"
-                )
-                return f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+                api.dataset_info(BUCKET_NAME)
+                repo_type = "dataset"
+                url = f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
             except Exception:
-                api.upload_file(
-                    path_or_fileobj=dest_path,
-                    path_in_repo=f"uploads/{saved_filename}",
-                    repo_id=BUCKET_NAME,
-                    repo_type="model"
-                )
-                return f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
-        
+                repo_type = "model"
+                url = f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+            
+            api.upload_file(
+                path_or_fileobj=dest_path,
+                path_in_repo=f"uploads/{saved_filename}",
+                repo_id=BUCKET_NAME,
+                repo_type=repo_type
+            )
+            return url
+            
         try:
             file_url = await asyncio.to_thread(_upload_to_hf)
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
         except Exception as e:
             print(f"[Cloud Sync] Direct upload error: {e}")
             base_url = str(request.base_url).rstrip("/")
@@ -1335,8 +1365,7 @@ async def upload_media_file(
         set_nested(DATABASE, path_parts, record)
         await save_db()
         await broadcast(clean_path, record, "put")
-    
-    asyncio.create_task(run_cloud_sync("push"))
+
     return {"status": "success", "path": clean_path, "data": record}
 
 @app.get("/api-data")
@@ -1385,7 +1414,7 @@ async def make_backup():
         data_str = json.dumps(DATABASE, indent=2)
         await asyncio.to_thread(_atomic_write_text, dest, data_str)
     
-    await run_cloud_sync("push")
+    asyncio.create_task(push_state_to_cloud(f"backups/{filename}"))
     return {"status": "created", "filename": filename}
 
 @app.post("/_admin/backups/restore/{filename}")
@@ -1417,12 +1446,7 @@ async def delete_backup(filename: str):
     fp = _safe_backup_path(filename)
     if os.path.exists(fp):
         os.remove(fp)
-    
-    async def _delete_task():
-        await run_cloud_delete(f"backups/{filename}")
-        await run_cloud_sync("push")
-
-    asyncio.create_task(_delete_task())
+    asyncio.create_task(run_cloud_delete(f"backups/{filename}"))
     return {"status": "deleted"}
 
 @app.get("/api/usage")
@@ -1604,7 +1628,6 @@ async def delete_endpoint(full_path: str = ""):
         async def _del_files():
             for p in del_paths:
                 await run_cloud_delete(p)
-            await run_cloud_sync("push")
         asyncio.create_task(_del_files())
         
     return {"status": "deleted", "path": clean_path}
