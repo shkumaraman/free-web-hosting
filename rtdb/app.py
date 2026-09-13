@@ -765,10 +765,10 @@ HTML_CONSOLE = """
                 </div>
                 <div class="flex gap-2">
                     <button onclick="loadRules()" class="bg-gray-100 hover:bg-gray-200 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5">
-                        Discard Changes
+                        Discard
                     </button>
                     <button onclick="publishRules()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 shadow-xs">
-                        Publish Rules
+                        Publish
                     </button>
                 </div>
             </div>
