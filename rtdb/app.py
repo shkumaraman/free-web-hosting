@@ -46,7 +46,7 @@ active_websockets = set()
 STORAGE_BYTES = 0
 METRICS_DIRTY = False
 
-STORAGE_DIR = os.getenv("STORAGE_DIR", "./data")
+STORAGE_DIR = os.getenv("STORAGE_DIR", "/data")
 RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
 DB_FILE = os.path.join(STORAGE_DIR, "db.json")
 METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
@@ -282,24 +282,14 @@ class SafeRuleEval(EvalWithCompoundTypes):
 
 def load_rules():
     global RULES
-    candidates = [
-        RULES_FILE,
-        os.path.join(STORAGE_DIR, "rules.json"),
-        "rules.json",
-        "./rules.json",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    RULES = json.load(f)
-                    print(f"[Rules] Successfully loaded from {path}")
-                    return
-            except Exception as e:
-                print(f"[Rules Error] Could not parse {path}: {e}")
-
-    print("[Rules] No valid rules.json found. Initializing open rules...")
-    RULES = {"rules": {".read": True, ".write": True}}
+    if os.path.exists(RULES_FILE):
+        try:
+            with open(RULES_FILE, "r", encoding="utf-8") as f:
+                RULES = json.load(f)
+            return
+        except Exception:
+            pass
+    RULES = {"rules": {".read": True, ".write": False}}
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
 
 
@@ -759,7 +749,7 @@ HTML_CONSOLE = """
         <div id="tab-rules" class="hidden min-h-full flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (rules.json)</h2>
+                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (/data/rules.json)</h2>
                     <p class="text-xs text-gray-500">Edit and publish rules directly to persistent storage.</p>
                 </div>
                 <div class="flex gap-2">
@@ -935,7 +925,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
