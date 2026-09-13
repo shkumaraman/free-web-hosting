@@ -282,14 +282,24 @@ class SafeRuleEval(EvalWithCompoundTypes):
 
 def load_rules():
     global RULES
-    if os.path.exists(RULES_FILE):
-        try:
-            with open(RULES_FILE, "r", encoding="utf-8") as f:
-                RULES = json.load(f)
-            return
-        except Exception:
-            pass
-    RULES = {"rules": {".read": True, ".write": False}}
+    candidates = [
+        RULES_FILE,
+        os.path.join(STORAGE_DIR, "rules.json"),
+        "rules.json",
+        "./rules.json",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    RULES = json.load(f)
+                    print(f"[Rules] Successfully loaded from {path}")
+                    return
+            except Exception as e:
+                print(f"[Rules Error] Could not parse {path}: {e}")
+
+    print("[Rules] No valid rules.json found. Initializing open rules...")
+    RULES = {"rules": {".read": True, ".write": True}}
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
 
 
