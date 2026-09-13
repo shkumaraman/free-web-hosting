@@ -46,7 +46,7 @@ active_websockets = set()
 STORAGE_BYTES = 0
 METRICS_DIRTY = False
 
-STORAGE_DIR = os.getenv("STORAGE_DIR", "/data")
+STORAGE_DIR = os.getenv("STORAGE_DIR", "./data")
 RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
 DB_FILE = os.path.join(STORAGE_DIR, "db.json")
 METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
@@ -282,14 +282,24 @@ class SafeRuleEval(EvalWithCompoundTypes):
 
 def load_rules():
     global RULES
-    if os.path.exists(RULES_FILE):
-        try:
-            with open(RULES_FILE, "r", encoding="utf-8") as f:
-                RULES = json.load(f)
-            return
-        except Exception:
-            pass
-    RULES = {"rules": {".read": True, ".write": False}}
+    candidates = [
+        RULES_FILE,
+        os.path.join(STORAGE_DIR, "rules.json"),
+        "rules.json",
+        "./rules.json",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    RULES = json.load(f)
+                    print(f"[Rules] Successfully loaded from {path}")
+                    return
+            except Exception as e:
+                print(f"[Rules Error] Could not parse {path}: {e}")
+
+    print("[Rules] No valid rules.json found. Initializing open rules...")
+    RULES = {"rules": {".read": True, ".write": True}}
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
 
 
@@ -749,7 +759,7 @@ HTML_CONSOLE = """
         <div id="tab-rules" class="hidden min-h-full flex flex-col">
             <div class="flex justify-between items-center mb-3">
                 <div>
-                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (/data/rules.json)</h2>
+                    <h2 class="text-sm font-semibold text-gray-800">Security Rules (rules.json)</h2>
                     <p class="text-xs text-gray-500">Edit and publish rules directly to persistent storage.</p>
                 </div>
                 <div class="flex gap-2">
@@ -1258,7 +1268,13 @@ HTML_CONSOLE = """
         async function deleteNode(path) {
             if (confirm(`Delete node "/${path}"?`)) {
                 expandedPaths.delete(path);
-                await fetch(`/${path}.json`, { method: 'DELETE' });
+                const res = await fetch(`/${path}.json`, { method: 'DELETE' });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Delete failed: ' + (err.detail || 'Permission denied'));
+                } else {
+                    refreshData();
+                }
             }
         }
 
@@ -1284,7 +1300,14 @@ HTML_CONSOLE = """
         }
 
         async function clearDatabase() {
-            if (confirm('Clear entire database? This cannot be undone.')) { await fetch('/.json', { method: 'DELETE' }); }
+            if (confirm('Clear entire database? This cannot be undone.')) {
+                const res = await fetch('/.json', { method: 'DELETE' });
+                if (!res.ok) {
+                    alert('Failed to clear database: Permission denied');
+                } else {
+                    refreshData();
+                }
+            }
         }
         refreshData(); initWebSocket();
     </script>
@@ -1331,6 +1354,9 @@ async def serve_upload_file(filename: str):
 
 @app.delete("/uploads/{filename:path}")
 async def delete_upload_file(filename: str):
+    if filename.endswith(".json"):
+        return await delete_endpoint(f"uploads/{filename}")
+
     clean_name = os.path.basename(filename)
     fpath = os.path.join(UPLOADS_DIR, clean_name)
     if os.path.isfile(fpath):
