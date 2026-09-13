@@ -64,6 +64,7 @@ async def run_cloud_sync(direction: str):
 async def run_cloud_delete(relative_path: str):
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return
+
     def _python_delete():
         try:
             from huggingface_hub import HfFileSystem
@@ -85,8 +86,9 @@ def check_nsfw_image(file_path: str) -> bool:
         nsfw_prob = n2.predict_image(file_path)
         if nsfw_prob >= 0.75:
             return True
-    except Exception:
-        return False
+    except Exception as e:
+        print(f"[NSFW] Blocked due to exception: {e}")
+        return True
     return False
 
 DATABASE: Dict[str, Any] = {}
@@ -204,7 +206,7 @@ def load_rules():
             return
         except Exception:
             pass
-    RULES = {"rules": {".read": True, ".write": True}}
+    RULES = {"rules": {".read": True, ".write": False}}
     _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
 
 def load_database():
@@ -313,7 +315,7 @@ app = FastAPI(title="Realtime Database", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -326,16 +328,9 @@ async def bandwidth_tracker(request: Request, call_next):
         and not request.url.path.startswith("/_admin")
         and not request.url.path.startswith("/uploads")
     ):
-        body_iterator = response.body_iterator
-        resp_body = [chunk async for chunk in body_iterator]
-        total_bytes = sum(len(chunk) for chunk in resp_body)
-        sync_metrics(bandwidth_bytes=total_bytes)
-        return Response(
-            content=b"".join(resp_body),
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type=response.media_type,
-        )
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdigit():
+            sync_metrics(bandwidth_bytes=int(content_length))
     return response
 
 def _write_db_sync():
@@ -574,14 +569,12 @@ HTML_CONSOLE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Realtime Database</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Roboto', -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #ffffff; color: #202124; }
-        .mono { font-family: 'Roboto Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #ffffff; color: #202124; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
         .node-row:hover .actions { display: inline-flex; }
         .actions { display: none; }
-        .node-row { font-family: 'Roboto Mono', ui-monospace, monospace; font-size: 13px; color: #3c4043; }
+        .node-row { font-family: ui-monospace, monospace; font-size: 13px; color: #3c4043; }
         .node-toggle { display: inline-block; width: 14px; text-align: center; color: #80868b; font-size: 11px; transition: transform .15s ease; flex-shrink: 0; }
         .node-toggle.open { transform: rotate(90deg); }
         .node-dash { color: #9aa0a6; margin: 0 6px; flex-shrink: 0; }
@@ -819,7 +812,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -920,26 +913,32 @@ HTML_CONSOLE = """
 
         function selectMetric(metric) {
             activeMetric = metric;
-            const rows = { connections: document.getElementById('row-conn'), storage: document.getElementById('row-storage'), downloads: document.getElementById('row-downloads') };
-            Object.keys(rows).forEach(k => {
-                rows[k].className = 'p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100';
-                const title = rows[k].querySelector('div:first-child');
-                title.className = 'text-xs font-normal text-gray-600 flex items-center gap-1.5';
-                const val = rows[k].querySelector('span:first-child');
-                val.className = 'text-2xl font-normal text-gray-900';
+            const metrics = ['connections', 'storage', 'downloads'];
+            metrics.forEach(m => {
+                const rowId = m === 'connections' ? 'row-conn' : m === 'storage' ? 'row-storage' : 'row-downloads';
+                const valId = m === 'connections' ? 'metric-connections' : m === 'storage' ? 'metric-storage' : 'metric-bandwidth';
+                
+                const row = document.getElementById(rowId);
+                const titleDiv = row.querySelector('div');
+                const valSpan = document.getElementById(valId);
+                
+                if (m === metric) {
+                    row.className = 'p-4 cursor-pointer transition border-l-4 border-blue-600 bg-blue-50/40 border-b border-gray-100';
+                    titleDiv.className = 'text-xs font-normal text-blue-600 flex items-center gap-1.5';
+                    valSpan.className = 'text-2xl font-normal text-blue-600';
+                } else {
+                    row.className = 'p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100';
+                    titleDiv.className = 'text-xs font-normal text-gray-600 flex items-center gap-1.5';
+                    valSpan.className = 'text-2xl font-normal text-gray-900';
+                }
             });
-            rows[metric].className = 'p-4 cursor-pointer transition border-l-4 border-blue-600 bg-blue-50/40 border-b border-gray-100';
-            const activeTitle = rows[metric].querySelector('div:first-child');
-            activeTitle.className = 'text-xs font-normal text-blue-600 flex items-center gap-1.5';
-            const activeVal = rows[metric].querySelector('span:first-child');
-            activeVal.className = 'text-2xl font-normal text-blue-600';
             renderMetricChart();
         }
 
         function formatBytes(bytes) {
             if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
             if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-            if (bytes >= 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
             return bytes + ' B';
         }
 
@@ -1108,7 +1107,7 @@ HTML_CONSOLE = """
             } else {
                 document.getElementById('modal-heading').innerText = 'Edit Value';
                 keyGroup.style.display = 'none';
-                document.getElementById('input-val').value = typeof currentVal === 'string' ? currentVal : JSON.stringify(currentVal);
+                document.getElementById('input-val').value = JSON.stringify(currentVal);
             }
             document.getElementById('node-modal').classList.remove('hidden');
             document.getElementById('node-modal').classList.add('flex');
@@ -1122,12 +1121,15 @@ HTML_CONSOLE = """
         async function submitModal() {
             const rawPath = document.getElementById('input-path').value.replace(/^\//, '');
             const rawVal = document.getElementById('input-val').value.trim();
-            let parsed = rawVal;
-            try { parsed = JSON.parse(rawVal); } catch (e) {
-                if (!isNaN(rawVal) && rawVal !== '') parsed = Number(rawVal);
-                else if (rawVal.toLowerCase() === 'true') parsed = true;
-                else if (rawVal.toLowerCase() === 'false') parsed = false;
-                else parsed = rawVal;
+            let parsed;
+            if (rawVal === '') {
+                parsed = "";
+            } else {
+                try {
+                    parsed = JSON.parse(rawVal);
+                } catch (e) {
+                    parsed = rawVal;
+                }
             }
             let target = rawPath;
             if (modalMode === 'add') {
@@ -1277,8 +1279,37 @@ async def upload_media_file(
                 detail="Explicit content is not allowed."
             )
             
-    base_url = str(request.base_url).rstrip("/")
-    file_url = f"{base_url}/uploads/{saved_filename}"
+    if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
+        def _upload_to_hf():
+            from huggingface_hub import HfApi
+            api = HfApi(token=HF_TOKEN)
+            try:
+                api.upload_file(
+                    path_or_fileobj=dest_path,
+                    path_in_repo=f"uploads/{saved_filename}",
+                    repo_id=BUCKET_NAME,
+                    repo_type="dataset"
+                )
+                return f"https://huggingface.co/datasets/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+            except Exception:
+                api.upload_file(
+                    path_or_fileobj=dest_path,
+                    path_in_repo=f"uploads/{saved_filename}",
+                    repo_id=BUCKET_NAME,
+                    repo_type="model"
+                )
+                return f"https://huggingface.co/{BUCKET_NAME}/resolve/main/uploads/{saved_filename}"
+        
+        try:
+            file_url = await asyncio.to_thread(_upload_to_hf)
+        except Exception as e:
+            print(f"[Cloud Sync] Direct upload error: {e}")
+            base_url = str(request.base_url).rstrip("/")
+            file_url = f"{base_url}/uploads/{saved_filename}"
+    else:
+        base_url = str(request.base_url).rstrip("/")
+        file_url = f"{base_url}/uploads/{saved_filename}"
+
     record = {
         "id": push_id,
         "name": original_name,
