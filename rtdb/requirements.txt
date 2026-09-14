@@ -4,7 +4,8 @@ python-multipart
 requests
 Pillow
 simpleeval
+PyJWT
 opennsfw2
 tf-keras
 tensorflow-cpu
-huggingface_hub[cli]
+huggingface_hub[hf_transfer]
