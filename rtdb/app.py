@@ -1728,9 +1728,19 @@ async def upload_media_file(
             os.remove(dest_path)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
-    pushed = await push_single_file_to_hf(dest_path, f"uploads/{saved_filename}")
-
-    if pushed or (HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR")):
+    is_hf_configured = bool(HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"))
+    if is_hf_configured:
+        pushed = await push_single_file_to_hf(dest_path, f"uploads/{saved_filename}")
+        if not pushed:
+            if os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Cloud storage push failed. Please try again.",
+            )
         if os.path.exists(dest_path):
             try:
                 os.remove(dest_path)
@@ -1998,7 +2008,7 @@ async def read_endpoint(
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     if not check_read_permission(path_parts, auth):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    
+
     async with db_lock:
         if not path_parts:
             data = copy.deepcopy(DATABASE)
@@ -2031,7 +2041,7 @@ async def read_endpoint(
 
         path_key = "/".join(path_parts)
         is_indexed = False
-        
+
         idx_cfg = get_index_configuration(path_parts)
         if isinstance(idx_cfg, list) and clean_order_by in idx_cfg:
             is_indexed = True
@@ -2041,7 +2051,7 @@ async def read_endpoint(
         if is_indexed:
             if path_key not in INDEX_CACHE:
                 INDEX_CACHE[path_key] = {}
-            
+
             if clean_order_by not in INDEX_CACHE[path_key]:
                 temp_list = []
                 for k, v in data.items():
@@ -2054,14 +2064,14 @@ async def read_endpoint(
                     else:
                         item_val = None
                     temp_list.append((item_val, k, v))
-                
+
                 try:
                     temp_list.sort(key=lambda x: (x[0] is None, x[0]))
                 except TypeError:
                     temp_list.sort(key=lambda x: (x[0] is None, str(x[0])))
-                    
+
                 INDEX_CACHE[path_key][clean_order_by] = temp_list
-                
+
             sorted_data = INDEX_CACHE[path_key][clean_order_by]
         else:
             sorted_data = []
@@ -2075,7 +2085,7 @@ async def read_endpoint(
                 else:
                     item_val = None
                 sorted_data.append((item_val, k, v))
-                
+
             try:
                 sorted_data.sort(key=lambda x: (x[0] is None, x[0]))
             except TypeError:
@@ -2111,9 +2121,9 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     if not check_validation(path_parts, payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-    
+
     clean_path = "/".join(path_parts)
-    
+
     async with db_lock:
         if_match = request.headers.get("if-match")
         if if_match:
@@ -2129,11 +2139,11 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
                 DATABASE["data"] = payload
         else:
             set_nested(DATABASE, path_parts, payload)
-            
+
         invalidate_cache(path_parts)
         await save_db()
         await broadcast(clean_path, payload, "put")
-        
+
     return payload
 
 
@@ -2146,9 +2156,9 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     if not check_validation(base_parts, payload, auth, is_patch=True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-    
+
     clean_path = "/".join(base_parts)
-    
+
     async with db_lock:
         if_match = request.headers.get("if-match")
         if if_match:
@@ -2166,11 +2176,11 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
             else:
                 set_nested(DATABASE, target_parts, val)
             invalidate_cache(target_parts)
-            
+
         invalidate_cache(base_parts)
         await save_db()
         await broadcast(clean_path, payload, "patch")
-        
+
     return payload
 
 
@@ -2205,7 +2215,7 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
     clean_path = "/".join(path_parts)
 
     del_paths = []
-    
+
     async with db_lock:
         if request is not None:
             if_match = request.headers.get("if-match")
@@ -2222,7 +2232,7 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
             if target is not None:
                 del_paths.extend(remove_associated_files(target))
             delete_nested(DATABASE, path_parts)
-            
+
         invalidate_cache(path_parts)
         await save_db()
         await broadcast(clean_path, None, "delete")
