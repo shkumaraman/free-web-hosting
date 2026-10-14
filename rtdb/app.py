@@ -2276,3 +2276,9 @@ async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
             if not subscriptions[clean_path]:
                 del subscriptions[clean_path]
         sync_metrics()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
