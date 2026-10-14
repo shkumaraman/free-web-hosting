@@ -294,29 +294,24 @@ def generate_push_id() -> str:
     return "".join(time_chars) + rand_chars
 
 
-def normalize_firebase_value(val: Any) -> Any:
+def normalize_firebase_data(val: Any) -> Any:
     """
-    Firebase RTDB normalization:
-    - null (None) -> None (triggers deletion)
-    - list (Array) -> dict with stringified index keys ("0", "1", ...), skipping nulls
-    - dict -> recursively normalized dict; empty dicts ({}) become None
+    Firebase behavior:
+    - null (None) means delete / non-existent
+    - arrays (list) are stored as string-indexed objects {"0": ..., "1": ...}
+    - empty objects ({}) do not exist and collapse to None
     """
     if val is None:
         return None
     if isinstance(val, list):
-        res = {}
-        for idx, item in enumerate(val):
-            norm_item = normalize_firebase_value(item)
-            if norm_item is not None:
-                res[str(idx)] = norm_item
-        return res if res else None
+        val = {str(i): v for i, v in enumerate(val)}
     if isinstance(val, dict):
-        res = {}
+        cleaned = {}
         for k, v in val.items():
-            norm_v = normalize_firebase_value(v)
-            if norm_v is not None:
-                res[str(k)] = norm_v
-        return res if res else None
+            nv = normalize_firebase_data(v)
+            if nv is not None:
+                cleaned[str(k)] = nv
+        return cleaned if cleaned else None
     return val
 
 
@@ -466,9 +461,9 @@ def load_database():
                 content = f.read().strip()
                 if content:
                     DATABASE.clear()
-                    norm = normalize_firebase_value(json.loads(content))
-                    if isinstance(norm, dict):
-                        DATABASE.update(norm)
+                    loaded = normalize_firebase_data(json.loads(content))
+                    if isinstance(loaded, dict):
+                        DATABASE.update(loaded)
         except Exception:
             DATABASE.clear()
 
@@ -620,35 +615,33 @@ async def save_rules_file():
 
 
 def delete_nested(data: dict, path_parts: List[str]) -> bool:
-    """Deletes nested key and prunes any parent dicts that become empty."""
     if not path_parts or not isinstance(data, dict):
         return False
-    key = path_parts[0]
+    part = path_parts[0]
+    if part not in data:
+        return False
     if len(path_parts) == 1:
-        if key in data:
-            del data[key]
-            return True
+        del data[part]
+        return True
+    child = data[part]
+    if not isinstance(child, dict):
         return False
-    sub = data.get(key)
-    if not isinstance(sub, dict):
-        return False
-    deleted = delete_nested(sub, path_parts[1:])
-    if deleted and not sub:
-        del data[key]
+    deleted = delete_nested(child, path_parts[1:])
+    if deleted and not child:
+        del data[part]
     return deleted
 
 
 def set_nested(data: dict, path_parts: List[str], value: Any):
-    """Sets normalized value at path, or deletes & prunes if normalized value is None."""
-    norm_val = normalize_firebase_value(value)
+    cleaned = normalize_firebase_data(value)
     if not path_parts:
         data.clear()
-        if isinstance(norm_val, dict):
-            data.update(norm_val)
-        elif norm_val is not None:
-            data["data"] = norm_val
+        if isinstance(cleaned, dict):
+            data.update(cleaned)
+        elif cleaned is not None:
+            data["data"] = cleaned
         return
-    if norm_val is None:
+    if cleaned is None:
         delete_nested(data, path_parts)
         return
     current = data
@@ -656,7 +649,7 @@ def set_nested(data: dict, path_parts: List[str], value: Any):
         if part not in current or not isinstance(current[part], dict):
             current[part] = {}
         current = current[part]
-    current[path_parts[-1]] = norm_val
+    current[path_parts[-1]] = cleaned
 
 
 def invalidate_cache(path_parts: List[str]):
@@ -669,23 +662,20 @@ def invalidate_cache(path_parts: List[str]):
         del INDEX_CACHE[k]
 
 
-def find_file_record_paths(node: Any, target_filename: str, current_path: List[str] = None) -> List[List[str]]:
+def find_file_record_paths(node: Any, clean_name: str, current_path: Optional[List[str]] = None) -> List[List[str]]:
     if current_path is None:
         current_path = []
-    matches = []
+    matched_paths: List[List[str]] = []
     if isinstance(node, dict):
-        if (
-            node.get("filename") == target_filename
-            and any(k in node for k in ("id", "content_type", "url", "timestamp"))
-        ):
-            matches.append(current_path)
-            return matches
-        for k, v in node.items():
-            matches.extend(find_file_record_paths(v, target_filename, current_path + [str(k)]))
+        if node.get("filename") == clean_name:
+            matched_paths.append(current_path)
+        else:
+            for k, v in node.items():
+                matched_paths.extend(find_file_record_paths(v, clean_name, current_path + [str(k)]))
     elif isinstance(node, list):
         for idx, item in enumerate(node):
-            matches.extend(find_file_record_paths(item, target_filename, current_path + [str(idx)]))
-    return matches
+            matched_paths.extend(find_file_record_paths(item, clean_name, current_path + [str(idx)]))
+    return matched_paths
 
 
 def remove_associated_files(node: Any) -> List[str]:
@@ -720,15 +710,22 @@ def _build_post_write_root(path_parts: List[str], new_payload: Any, is_patch: bo
             full_parts = path_parts + rel_parts
             if not full_parts:
                 continue
-            set_nested(virtual, full_parts, val)
+            cleaned_val = normalize_firebase_data(val)
+            if cleaned_val is None:
+                delete_nested(virtual, full_parts)
+            else:
+                set_nested(virtual, full_parts, cleaned_val)
         return virtual
 
-    norm_payload = normalize_firebase_value(new_payload)
+    cleaned_payload = normalize_firebase_data(new_payload)
     if not path_parts:
-        if isinstance(norm_payload, dict):
-            return norm_payload
-        return {"data": norm_payload} if norm_payload is not None else {}
-    set_nested(virtual, path_parts, norm_payload)
+        if isinstance(cleaned_payload, dict):
+            return cleaned_payload
+        return {"data": cleaned_payload} if cleaned_payload is not None else {}
+    if cleaned_payload is None:
+        delete_nested(virtual, path_parts)
+    else:
+        set_nested(virtual, path_parts, cleaned_payload)
     return virtual
 
 
@@ -740,7 +737,7 @@ def eval_firebase_expr(
     auth: Optional[AuthContext] = None,
     root_val: Any = None,
     new_root_val: Any = None,
-    current_path: List[str] = None,
+    current_path: List[str] = None
 ) -> bool:
     if isinstance(expr, bool):
         return expr
@@ -814,9 +811,7 @@ def check_read_permission(path_parts: List[str], auth: Optional[AuthContext] = N
         if matched_key:
             current_rule = current_rule[matched_key]
             if isinstance(current_rule, dict) and ".read" in current_rule:
-                if eval_firebase_expr(
-                    current_rule[".read"], data_val, None, wildcards, auth, root_val, root_val, current_sub_path
-                ):
+                if eval_firebase_expr(current_rule[".read"], data_val, None, wildcards, auth, root_val, root_val, current_sub_path):
                     return True
         else:
             break
@@ -831,11 +826,9 @@ def check_write_permission(
     existing_val = get_nested(DATABASE, path_parts) if path_parts else DATABASE
     root_val = DATABASE
     new_root_val = _build_post_write_root(path_parts, new_payload, is_patch=is_patch)
-    target_new_root = get_nested(new_root_val, path_parts) if path_parts else new_root_val
+    target_new_root = get_nested(new_root_val, path_parts) if path_parts else (new_root_val or None)
     if ".write" in current_rule:
-        if eval_firebase_expr(
-            current_rule[".write"], existing_val, target_new_root, wildcards, auth, root_val, new_root_val, path_parts
-        ):
+        if eval_firebase_expr(current_rule[".write"], existing_val, target_new_root, wildcards, auth, root_val, new_root_val, path_parts):
             return True
     for i, part in enumerate(path_parts):
         if not isinstance(current_rule, dict):
@@ -856,14 +849,7 @@ def check_write_permission(
             if isinstance(current_rule, dict) and ".write" in current_rule:
                 target_new = get_nested(new_root_val, current_sub_path)
                 if eval_firebase_expr(
-                    current_rule[".write"],
-                    data_val,
-                    target_new,
-                    wildcards,
-                    auth,
-                    root_val,
-                    new_root_val,
-                    current_sub_path,
+                    current_rule[".write"], data_val, target_new, wildcards, auth, root_val, new_root_val, current_sub_path
                 ):
                     return True
         else:
@@ -878,9 +864,9 @@ def validate_rules_recursively(
     auth: Optional[AuthContext] = None,
     root_val: Any = None,
     new_root_val: Any = None,
-    current_path: List[str] = None,
+    current_path: List[str] = None
 ) -> bool:
-    if data_node is None or not isinstance(rule_node, dict):
+    if not isinstance(rule_node, dict) or data_node is None:
         return True
     if ".validate" in rule_node:
         expr = rule_node[".validate"]
@@ -900,9 +886,7 @@ def validate_rules_recursively(
                         break
             if matched_rule and isinstance(matched_rule, dict):
                 next_path = (current_path or []) + [str(k)]
-                if not validate_rules_recursively(
-                    matched_rule, v, next_wildcards, auth, root_val, new_root_val, next_path
-                ):
+                if not validate_rules_recursively(matched_rule, v, next_wildcards, auth, root_val, new_root_val, next_path):
                     return False
     return True
 
@@ -930,7 +914,7 @@ def check_validation(
             current_rule = current_rule[matched_key]
         else:
             return True
-    target_payload = get_nested(new_root_val, path_parts) if path_parts else new_root_val
+    target_payload = get_nested(new_root_val, path_parts) if path_parts else (new_root_val or None)
     return validate_rules_recursively(current_rule, target_payload, wildcards, auth, root_val, new_root_val, path_parts)
 
 
@@ -1010,13 +994,10 @@ HTML_CONSOLE = """
         .node-row { font-family: ui-monospace, monospace; font-size: 13px; color: #3c4043; }
         .node-toggle { display: inline-block; width: 14px; text-align: center; color: #80868b; font-size: 11px; transition: transform .15s ease; flex-shrink: 0; }
         .node-toggle.open { transform: rotate(90deg); }
+        .node-dash { color: #9aa0a6; margin: 0 6px; flex-shrink: 0; }
         .tree-line { border-left: 1px dotted #cfd2d6; }
         .no-scrollbar::-webkit-scrollbar { display: none; }
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-        @keyframes fadeAdd  { from { background:#ceead6 } to { background:transparent } }
-        @keyframes fadeEdit { from { background:#fde293 } to { background:transparent } }
-        .flash-add  { animation: fadeAdd 3s ease-out; }
-        .flash-edit { animation: fadeEdit 3s ease-out; }
     </style>
 </head>
 <body class="h-screen flex flex-col overflow-hidden text-slate-800">
@@ -1042,6 +1023,10 @@ HTML_CONSOLE = """
             </button>
         </div>
         <div class="flex items-center gap-2 shrink-0">
+            <button onclick="openModal('add', '')" class="bg-blue-600 hover:bg-blue-700 text-white font-medium px-3 py-1.5 rounded-md flex items-center gap-1.5 shadow-xs transition">
+                <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                <span>Add node</span>
+            </button>
             <div class="relative">
                 <button onclick="toggleMenu()" class="w-8 h-8 rounded-full hover:bg-gray-200 flex items-center justify-center text-gray-600">
                     <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
@@ -1177,21 +1162,42 @@ HTML_CONSOLE = """
         </div>
     </main>
 
+    <div id="node-modal" class="fixed inset-0 bg-black/40 hidden items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-lg shadow-xl w-full max-w-md p-5 border border-gray-200 text-gray-800">
+            <h3 id="modal-heading" class="text-sm font-semibold mb-3 text-gray-900">Add Child Node</h3>
+            <div class="space-y-3 text-xs">
+                <div>
+                    <label class="block text-gray-600 font-medium mb-1">Path</label>
+                    <input id="input-path" type="text" readonly class="w-full bg-gray-100 border border-gray-300 rounded px-3 py-2 font-mono text-gray-600 text-xs">
+                </div>
+                <div id="field-key-container">
+                    <label class="block text-gray-600 font-medium mb-1">Key</label>
+                    <input id="input-key" type="text" placeholder="Key (e.g. name, user_id, profile)" class="w-full bg-white border border-gray-300 rounded px-3 py-2 font-mono text-gray-800 text-xs focus:outline-blue-500">
+                </div>
+                <div>
+                    <label class="block text-gray-600 font-medium mb-1">Value</label>
+                    <textarea id="input-val" rows="4" placeholder='Value (e.g. "Hello", 123, true, or {"title": "Hello"})' class="w-full bg-white border border-gray-300 rounded px-3 py-2 font-mono text-gray-800 text-xs focus:outline-blue-500"></textarea>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2 mt-5 text-xs font-medium">
+                <button onclick="closeModal()" class="px-4 py-2 border border-gray-300 rounded hover:bg-gray-100 text-gray-700">Cancel</button>
+                <button onclick="submitModal()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded">Save</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let db = {};
-        let prevDb = null;
-        let changedPaths = new Map();
         let ws = null;
+        let modalMode = 'add';
         let usageData = null;
         let activeMetric = 'downloads';
         let currentPeriod = 'daily';
-        let expandedPaths = new Set(['']);
-        const baseOrigin = window.location.origin + '/';
-        document.getElementById('base-endpoint').innerText = baseOrigin;
-
-        const SVG_PLUS = `<svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>`;
+        let expandedPaths = new Set();
+        document.getElementById('base-endpoint').innerText = window.location.origin + '/';
+        const SVG_PLUS = `<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>`;
         const SVG_EDIT = `<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>`;
-        const SVG_TRASH = `<svg class="w-3.5 h-3.5 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`;
+        const SVG_TRASH = `<svg class="w-3 h-3 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`;
 
         function toggleMenu() { document.getElementById('dropdown-menu').classList.toggle('hidden'); }
         function togglePeriodDropdown() { document.getElementById('period-dropdown').classList.toggle('hidden'); }
@@ -1214,7 +1220,7 @@ HTML_CONSOLE = """
         }
 
         function copyUrl() {
-            navigator.clipboard.writeText(baseOrigin);
+            navigator.clipboard.writeText(window.location.origin + '/');
             const btn = document.getElementById('copy-btn');
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
@@ -1396,64 +1402,15 @@ HTML_CONSOLE = """
             pt.classList.remove('hidden');
         }
 
-        function computeDiff(oldNode, newNode, currentPath = '') {
-            if (newNode === null || newNode === undefined) return;
-            const isNewObj = typeof newNode === 'object' && !Array.isArray(newNode);
-            const isOldObj = oldNode !== null && oldNode !== undefined && typeof oldNode === 'object' && !Array.isArray(oldNode);
-
-            if (oldNode === undefined || oldNode === null) {
-                if (currentPath !== '') changedPaths.set(currentPath, 'add');
-                if (isNewObj) {
-                    Object.keys(newNode).forEach(k => {
-                        const sub = currentPath ? `${currentPath}/${k}` : k;
-                        computeDiff(undefined, newNode[k], sub);
-                    });
-                }
-                return;
-            }
-
-            if (!isNewObj && !isOldObj) {
-                if (oldNode !== newNode && currentPath !== '') {
-                    changedPaths.set(currentPath, 'edit');
-                }
-                return;
-            }
-
-            if (isNewObj && isOldObj) {
-                Object.keys(newNode).forEach(k => {
-                    const sub = currentPath ? `${currentPath}/${k}` : k;
-                    computeDiff(oldNode[k], newNode[k], sub);
-                });
-            } else if (currentPath !== '') {
-                changedPaths.set(currentPath, 'edit');
-            }
-        }
-
-        function applyNewDbState(newData) {
-            const cleanData = newData || {};
-            changedPaths.clear();
-            if (prevDb !== null) {
-                computeDiff(prevDb, cleanData, '');
-            }
-            prevDb = JSON.parse(JSON.stringify(cleanData));
-            db = cleanData;
-            renderTree();
-        }
-
         function initWebSocket() {
             const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${window.location.host}/ws/`);
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
                 if (msg.event === 'connected') {
-                    if (msg.data && Object.keys(msg.data).length > 0) {
-                        applyNewDbState(msg.data);
-                    } else {
-                        refreshData();
-                    }
-                } else {
-                    refreshData();
-                }
+                    if (msg.data && Object.keys(msg.data).length > 0) { db = msg.data; renderTree(); }
+                    else { refreshData(); }
+                } else { refreshData(); }
             };
             ws.onclose = () => { setTimeout(initWebSocket, 2500); };
         }
@@ -1463,352 +1420,153 @@ HTML_CONSOLE = """
                 const r = await fetch('/api-data');
                 if (r.ok) {
                     const data = await r.json();
-                    applyNewDbState(data || {});
+                    db = data || {};
+                    renderTree();
                 }
             } catch (e) {}
-        }
-
-        function parseInputValue(rawVal) {
-            const trimmed = rawVal.trim();
-            if (trimmed === '') return null;
-            try {
-                return JSON.parse(trimmed);
-            } catch (e) {
-                return trimmed;
-            }
         }
 
         function renderTree() {
             const root = document.getElementById('tree-root');
             root.innerHTML = '';
-            root.appendChild(createRootNode());
-        }
-
-        function createRootNode() {
-            const container = document.createElement('div');
-            container.className = 'my-0.5';
-            const keys = db ? Object.keys(db).filter(k => db[k] !== null && db[k] !== undefined) : [];
-            const hasChildren = keys.length > 0;
-
-            const row = document.createElement('div');
-            row.className = 'node-row group flex items-center py-1 px-2 rounded hover:bg-gray-100 transition cursor-pointer';
-
-            const toggleWrap = document.createElement('span');
-            toggleWrap.className = 'node-toggle';
-            toggleWrap.innerText = hasChildren ? '▸' : '';
-            row.appendChild(toggleWrap);
-
-            const keyEl = document.createElement('span');
-            keyEl.className = 'text-gray-800 font-medium mr-1.5';
-            keyEl.innerText = baseOrigin.replace(/\/$/, '');
-            row.appendChild(keyEl);
-
-            if (!hasChildren) {
-                const colon = document.createElement('span');
-                colon.className = 'text-gray-400 mr-2';
-                colon.innerText = ':';
-                row.appendChild(colon);
-                const nullEl = document.createElement('span');
-                nullEl.className = 'text-gray-400';
-                nullEl.innerText = 'null';
-                row.appendChild(nullEl);
+            if (!db || Object.keys(db).length === 0) {
+                root.innerHTML = '<div class="text-gray-400 italic py-6 text-center text-xs">Database is empty. Click "+ Add node" to begin.</div>';
+                return;
             }
-
-            const actions = document.createElement('div');
-            actions.className = 'actions ml-4 items-center gap-1.5';
-            const addBtn = document.createElement('button');
-            addBtn.className = 'w-5 h-5 rounded hover:bg-gray-200 text-gray-600 flex items-center justify-center';
-            addBtn.innerHTML = SVG_PLUS;
-            addBtn.title = 'Add child node';
-            actions.appendChild(addBtn);
-            row.appendChild(actions);
-            container.appendChild(row);
-
-            const childrenBox = document.createElement('div');
-            childrenBox.className = 'pl-5 tree-line ml-2 space-y-0.5';
-            const isOpen = expandedPaths.has('');
-            childrenBox.style.display = isOpen ? 'block' : 'none';
-            toggleWrap.classList.toggle('open', isOpen && hasChildren);
-
-            keys.forEach(k => {
-                const branch = createBranch(k, k, db[k]);
-                if (branch) childrenBox.appendChild(branch);
-            });
-            container.appendChild(childrenBox);
-
-            row.onclick = () => {
-                if (!hasChildren && childrenBox.children.length === 0) return;
-                const willOpen = childrenBox.style.display === 'none';
-                childrenBox.style.display = willOpen ? 'block' : 'none';
-                toggleWrap.classList.toggle('open', willOpen);
-                if (willOpen) expandedPaths.add(''); else expandedPaths.delete('');
-            };
-
-            addBtn.onclick = (e) => {
-                e.stopPropagation();
-                expandedPaths.add('');
-                childrenBox.style.display = 'block';
-                toggleWrap.classList.add('open');
-                showInlineAddRow(childrenBox, '');
-            };
-
-            return container;
+            Object.keys(db).forEach(k => { root.appendChild(createBranch(k, k, db[k])); });
         }
 
         function createBranch(path, key, val) {
-            if (val === null || val === undefined) return null;
-
-            const isObj = typeof val === 'object' && !Array.isArray(val);
+            const isObj = typeof val === 'object' && val !== null && !Array.isArray(val);
             const isArr = Array.isArray(val);
             const isContainer = isObj || isArr;
-
             const container = document.createElement('div');
             container.className = 'my-0.5';
-
             const row = document.createElement('div');
-            let rowClasses = 'node-row group flex items-center py-1 px-2 rounded hover:bg-gray-100 transition cursor-pointer';
-            if (changedPaths.get(path) === 'add') rowClasses += ' flash-add';
-            else if (changedPaths.get(path) === 'edit') rowClasses += ' flash-edit';
-            row.className = rowClasses;
-
+            row.className = 'node-row group flex items-center py-1 px-2 rounded hover:bg-gray-100 transition cursor-pointer';
             const toggleWrap = document.createElement('span');
             toggleWrap.className = 'node-toggle';
             toggleWrap.innerText = isContainer ? '▸' : '';
             row.appendChild(toggleWrap);
-
-            const keyEl = document.createElement('span');
-            keyEl.className = 'text-gray-800 mr-1.5';
-            keyEl.innerText = key;
-            row.appendChild(keyEl);
-
-            let valEl = null;
+            if (isContainer) {
+                const dash = document.createElement('span');
+                dash.className = 'node-dash';
+                dash.innerText = '—';
+                row.appendChild(dash);
+            }
+            if (key !== null) {
+                const keyEl = document.createElement('span');
+                keyEl.className = 'text-gray-800 mr-1.5';
+                keyEl.innerText = key;
+                row.appendChild(keyEl);
+                if (!isContainer) {
+                    const colon = document.createElement('span');
+                    colon.className = 'text-gray-400 mr-2';
+                    colon.innerText = ':';
+                    row.appendChild(colon);
+                }
+            }
             if (!isContainer) {
-                const colon = document.createElement('span');
-                colon.className = 'text-gray-400 mr-2';
-                colon.innerText = ':';
-                row.appendChild(colon);
-
-                valEl = document.createElement('span');
+                const valEl = document.createElement('span');
                 if (typeof val === 'string') { valEl.className = 'text-green-700'; valEl.innerText = `"${val}"`; }
                 else if (typeof val === 'number') { valEl.className = 'text-blue-600'; valEl.innerText = val; }
                 else if (typeof val === 'boolean') { valEl.className = 'text-purple-600'; valEl.innerText = val; }
+                else { valEl.className = 'text-gray-400'; valEl.innerText = 'null'; }
                 row.appendChild(valEl);
-                valEl.onclick = (e) => {
-                    e.stopPropagation();
-                    showInlineEditRow(row, path, key, val);
-                };
             }
-
             const actions = document.createElement('div');
             actions.className = 'actions ml-4 items-center gap-1.5';
-
-            if (!isContainer) {
+            if (isContainer) {
+                const addBtn = document.createElement('button');
+                addBtn.className = 'w-5 h-5 rounded hover:bg-gray-200 text-gray-600 flex items-center justify-center';
+                addBtn.innerHTML = SVG_PLUS; addBtn.title = 'Add child node';
+                addBtn.onclick = (e) => { e.stopPropagation(); openModal('add', path); };
+                actions.appendChild(addBtn);
+            } else {
                 const editBtn = document.createElement('button');
                 editBtn.className = 'w-5 h-5 rounded hover:bg-gray-200 text-gray-600 flex items-center justify-center';
-                editBtn.innerHTML = SVG_EDIT;
-                editBtn.title = 'Edit value';
-                editBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    showInlineEditRow(row, path, key, val);
-                };
+                editBtn.innerHTML = SVG_EDIT; editBtn.title = 'Edit node';
+                editBtn.onclick = (e) => { e.stopPropagation(); openModal('edit', path, val); };
                 actions.appendChild(editBtn);
             }
-
-            const addBtn = document.createElement('button');
-            addBtn.className = 'w-5 h-5 rounded hover:bg-gray-200 text-gray-600 flex items-center justify-center';
-            addBtn.innerHTML = SVG_PLUS;
-            addBtn.title = 'Add child node';
-            actions.appendChild(addBtn);
-
             if (path !== '') {
                 const delBtn = document.createElement('button');
                 delBtn.className = 'w-5 h-5 rounded hover:bg-red-100 flex items-center justify-center';
-                delBtn.innerHTML = SVG_TRASH;
-                delBtn.title = 'Delete node';
+                delBtn.innerHTML = SVG_TRASH; delBtn.title = 'Delete node';
                 delBtn.onclick = (e) => { e.stopPropagation(); deleteNode(path); };
                 actions.appendChild(delBtn);
             }
-
             row.appendChild(actions);
             container.appendChild(row);
-
-            const childrenBox = document.createElement('div');
-            childrenBox.className = 'pl-5 tree-line ml-2 space-y-0.5';
-
             if (isContainer) {
+                const childrenBox = document.createElement('div');
+                childrenBox.className = 'pl-5 tree-line ml-2 space-y-0.5';
                 const isOpen = expandedPaths.has(path);
                 childrenBox.style.display = isOpen ? 'block' : 'none';
                 toggleWrap.classList.toggle('open', isOpen);
                 const keys = isObj ? Object.keys(val) : val.map((_, i) => i);
                 keys.forEach(k => {
-                    if (val[k] === null || val[k] === undefined) return;
                     const subPath = path ? `${path}/${k}` : `${k}`;
-                    const childBranch = createBranch(subPath, k, val[k]);
-                    if (childBranch) childrenBox.appendChild(childBranch);
+                    childrenBox.appendChild(createBranch(subPath, k, val[k]));
                 });
+                container.appendChild(childrenBox);
                 row.onclick = () => {
                     const willOpen = childrenBox.style.display === 'none';
                     childrenBox.style.display = willOpen ? 'block' : 'none';
                     toggleWrap.classList.toggle('open', willOpen);
                     if (willOpen) expandedPaths.add(path); else expandedPaths.delete(path);
                 };
-            } else {
-                childrenBox.style.display = 'none';
             }
-
-            container.appendChild(childrenBox);
-
-            addBtn.onclick = (e) => {
-                e.stopPropagation();
-                expandedPaths.add(path);
-                childrenBox.style.display = 'block';
-                toggleWrap.classList.add('open');
-                showInlineAddRow(childrenBox, path);
-            };
-
             return container;
         }
 
-        function showInlineAddRow(childrenBox, parentPath) {
-            const existing = childrenBox.querySelector('.inline-add-row');
-            if (existing) {
-                existing.querySelector('input').focus();
-                return;
+        function openModal(mode, path, currentVal = '') {
+            modalMode = mode;
+            document.getElementById('input-path').value = path ? `/${path}` : '/';
+            const keyGroup = document.getElementById('field-key-container');
+            if (mode === 'add') {
+                document.getElementById('modal-heading').innerText = 'Add Child Node';
+                keyGroup.style.display = 'block';
+                document.getElementById('input-key').value = '';
+                document.getElementById('input-val').value = '';
+            } else {
+                document.getElementById('modal-heading').innerText = 'Edit Value';
+                keyGroup.style.display = 'none';
+                document.getElementById('input-val').value = JSON.stringify(currentVal);
             }
-            const formRow = document.createElement('div');
-            formRow.className = 'inline-add-row flex items-center gap-1.5 py-1 px-2 bg-blue-50/60 border border-blue-200 rounded my-1';
-
-            const keyInput = document.createElement('input');
-            keyInput.type = 'text';
-            keyInput.placeholder = 'Name';
-            keyInput.className = 'bg-white border border-gray-300 rounded px-2 py-0.5 text-xs mono text-gray-800 w-32 focus:outline-blue-500';
-
-            const colon = document.createElement('span');
-            colon.className = 'text-gray-400';
-            colon.innerText = ':';
-
-            const valInput = document.createElement('input');
-            valInput.type = 'text';
-            valInput.placeholder = 'Value';
-            valInput.className = 'bg-white border border-gray-300 rounded px-2 py-0.5 text-xs mono text-gray-800 w-44 focus:outline-blue-500';
-
-            const saveBtn = document.createElement('button');
-            saveBtn.className = 'bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-0.5 rounded text-xs font-sans font-medium';
-            saveBtn.innerText = 'Add';
-
-            const cancelBtn = document.createElement('button');
-            cancelBtn.className = 'text-gray-600 hover:bg-gray-200 px-2 py-0.5 rounded text-xs font-sans';
-            cancelBtn.innerText = 'Cancel';
-
-            const submitAdd = async () => {
-                const k = keyInput.value.trim();
-                if (!k) return keyInput.focus();
-                const parsed = parseInputValue(valInput.value);
-                if (parsed === null) {
-                    formRow.remove();
-                    return;
-                }
-                const target = parentPath ? `${parentPath}/${k}` : k;
-                if (parentPath) expandedPaths.add(parentPath);
-                const res = await fetch(`/${target}.json`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(parsed)
-                });
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({}));
-                    alert('Action Denied: ' + (err.detail || 'Error'));
-                } else {
-                    formRow.remove();
-                    refreshData();
-                }
-            };
-
-            saveBtn.onclick = submitAdd;
-            cancelBtn.onclick = () => formRow.remove();
-
-            const handleKey = (e) => {
-                if (e.key === 'Enter') submitAdd();
-                if (e.key === 'Escape') formRow.remove();
-            };
-            keyInput.onkeydown = handleKey;
-            valInput.onkeydown = handleKey;
-
-            formRow.appendChild(keyInput);
-            formRow.appendChild(colon);
-            formRow.appendChild(valInput);
-            formRow.appendChild(saveBtn);
-            formRow.appendChild(cancelBtn);
-            childrenBox.appendChild(formRow);
-            keyInput.focus();
+            document.getElementById('node-modal').classList.remove('hidden');
+            document.getElementById('node-modal').classList.add('flex');
         }
 
-        function showInlineEditRow(row, path, key, currentVal) {
-            if (row.dataset.editing === 'true') return;
-            row.dataset.editing = 'true';
-            const originalNodes = Array.from(row.childNodes);
-            row.innerHTML = '';
+        function closeModal() {
+            document.getElementById('node-modal').classList.add('hidden');
+            document.getElementById('node-modal').classList.remove('flex');
+        }
 
-            const spacer = document.createElement('span');
-            spacer.className = 'node-toggle';
-            row.appendChild(spacer);
-
-            const keyEl = document.createElement('span');
-            keyEl.className = 'text-gray-800 mr-1.5';
-            keyEl.innerText = key;
-            row.appendChild(keyEl);
-
-            const colon = document.createElement('span');
-            colon.className = 'text-gray-400 mr-2';
-            colon.innerText = ':';
-            row.appendChild(colon);
-
-            const valInput = document.createElement('input');
-            valInput.type = 'text';
-            valInput.value = typeof currentVal === 'string' ? currentVal : JSON.stringify(currentVal);
-            valInput.className = 'bg-white border border-blue-400 rounded px-2 py-0.5 text-xs mono text-gray-800 w-48 focus:outline-blue-600';
-            row.appendChild(valInput);
-
-            const saveBtn = document.createElement('button');
-            saveBtn.className = 'ml-2 bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-0.5 rounded text-xs font-sans font-medium';
-            saveBtn.innerText = 'Save';
-            row.appendChild(saveBtn);
-
-            const cancelBtn = document.createElement('button');
-            cancelBtn.className = 'ml-1 text-gray-600 hover:bg-gray-200 px-2 py-0.5 rounded text-xs font-sans';
-            cancelBtn.innerText = 'Cancel';
-            row.appendChild(cancelBtn);
-
-            const restoreRow = () => {
-                row.innerHTML = '';
-                originalNodes.forEach(n => row.appendChild(n));
-                delete row.dataset.editing;
-            };
-
-            const submitEdit = async () => {
-                const parsed = parseInputValue(valInput.value);
-                const res = await fetch(`/${path}.json`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(parsed)
-                });
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({}));
-                    alert('Action Denied: ' + (err.detail || 'Error'));
-                } else {
-                    refreshData();
+        async function submitModal() {
+            const rawPath = document.getElementById('input-path').value.replace(/^\//, '');
+            const rawVal = document.getElementById('input-val').value.trim();
+            let parsed;
+            if (rawVal === '') {
+                parsed = "";
+            } else {
+                try {
+                    parsed = JSON.parse(rawVal);
+                } catch (e) {
+                    parsed = rawVal;
                 }
-            };
-
-            saveBtn.onclick = (e) => { e.stopPropagation(); submitEdit(); };
-            cancelBtn.onclick = (e) => { e.stopPropagation(); restoreRow(); };
-            valInput.onclick = (e) => e.stopPropagation();
-            valInput.onkeydown = (e) => {
-                if (e.key === 'Enter') submitEdit();
-                if (e.key === 'Escape') restoreRow();
-            };
-            valInput.focus();
-            valInput.select();
+            }
+            let target = rawPath;
+            if (modalMode === 'add') {
+                const key = document.getElementById('input-key').value.trim();
+                if (!key) return alert('Key name is required');
+                target = rawPath ? `${rawPath}/${key}` : key;
+            }
+            if (modalMode === 'add' && rawPath) expandedPaths.add(rawPath);
+            const targetPath = target ? `/${target}.json` : '/.json';
+            const res = await fetch(targetPath, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(parsed) });
+            if (!res.ok) { const err = await res.json(); alert('Action Denied: ' + (err.detail || 'Error')); }
+            else { closeModal(); }
         }
 
         async function deleteNode(path) {
@@ -1905,36 +1663,36 @@ async def delete_upload_file(filename: str, request: Request):
         return await delete_endpoint(f"uploads/{filename}", request)
 
     clean_name = os.path.basename(filename)
+    if not clean_name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
 
     async with db_lock:
         matched_paths = find_file_record_paths(DATABASE, clean_name)
-        if matched_paths:
-            for rec_path in matched_paths:
-                if not check_write_permission(rec_path, None, auth, is_patch=False):
-                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        else:
-            file_id = os.path.splitext(clean_name)[0]
-            if not check_write_permission(["uploads", file_id], None, auth, is_patch=False):
+        paths_to_check = matched_paths if matched_paths else [["uploads", os.path.splitext(clean_name)[0]]]
+
+        for p_parts in paths_to_check:
+            if not check_write_permission(p_parts, None, auth, is_patch=False):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
-        fpath = os.path.join(UPLOADS_DIR, clean_name)
-        if os.path.isfile(fpath):
-            try:
-                os.remove(fpath)
-            except Exception:
-                pass
-
-        asyncio.create_task(run_cloud_delete(f"uploads/{clean_name}"))
-
         db_changed = False
-        for rec_path in matched_paths:
-            if delete_nested(DATABASE, rec_path):
-                invalidate_cache(rec_path)
+        for p_parts in matched_paths:
+            if delete_nested(DATABASE, p_parts):
+                invalidate_cache(p_parts)
                 db_changed = True
 
         if db_changed:
+            invalidate_cache([])
             await save_db()
             await broadcast("", DATABASE, "put")
+
+    fpath = os.path.join(UPLOADS_DIR, clean_name)
+    if os.path.isfile(fpath):
+        try:
+            os.remove(fpath)
+        except Exception:
+            pass
+
+    asyncio.create_task(run_cloud_delete(f"uploads/{clean_name}"))
 
     return {"status": "deleted", "filename": clean_name}
 
@@ -2157,12 +1915,11 @@ async def restore_backup(filename: str):
         with open(src, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    data = await asyncio.to_thread(_read)
-    norm_data = normalize_firebase_value(data)
+    data = normalize_firebase_data(await asyncio.to_thread(_read))
     async with db_lock:
         DATABASE.clear()
-        if isinstance(norm_data, dict):
-            DATABASE.update(norm_data)
+        if isinstance(data, dict):
+            DATABASE.update(data)
         invalidate_cache([])
         await save_db()
         await broadcast("", DATABASE, "put")
@@ -2300,13 +2057,12 @@ async def read_endpoint(
 
     async with db_lock:
         if not path_parts:
-            data = copy.deepcopy(DATABASE) if DATABASE else None
+            data = copy.deepcopy(DATABASE)
         else:
             raw_data = get_nested(DATABASE, path_parts)
             data = copy.deepcopy(raw_data) if raw_data is not None else None
 
     if data is None:
-        response.headers["ETag"] = generate_etag(None)
         return None
 
     response.headers["ETag"] = generate_etag(data)
@@ -2407,11 +2163,11 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    norm_payload = normalize_firebase_value(payload)
+    cleaned_payload = normalize_firebase_data(payload)
 
-    if not check_write_permission(path_parts, norm_payload, auth, is_patch=False):
+    if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, norm_payload, auth, is_patch=False):
+    if not check_validation(path_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
     clean_path = "/".join(path_parts)
@@ -2424,7 +2180,7 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
             if generate_etag(current_data) != if_match:
                 raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
 
-        if norm_payload is None:
+        if cleaned_payload is None:
             if not path_parts:
                 del_paths.extend(remove_associated_files(DATABASE))
                 DATABASE.clear()
@@ -2433,14 +2189,12 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
                 if target is not None:
                     del_paths.extend(remove_associated_files(target))
                 delete_nested(DATABASE, path_parts)
-            invalidate_cache(path_parts)
-            await save_db()
-            await broadcast(clean_path, None, "delete")
         else:
-            set_nested(DATABASE, path_parts, norm_payload)
-            invalidate_cache(path_parts)
-            await save_db()
-            await broadcast(clean_path, norm_payload, "put")
+            set_nested(DATABASE, path_parts, cleaned_payload)
+
+        invalidate_cache(path_parts)
+        await save_db()
+        await broadcast(clean_path, cleaned_payload, "delete" if cleaned_payload is None else "put")
 
     if del_paths:
         async def _del_files():
@@ -2448,7 +2202,7 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
                 await run_cloud_delete(p)
         asyncio.create_task(_del_files())
 
-    return norm_payload
+    return cleaned_payload
 
 
 @app.patch("/{full_path:path}")
@@ -2456,14 +2210,15 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     base_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_write_permission(base_parts, payload, auth, is_patch=True):
+    normalized_patch = {str(k): normalize_firebase_data(v) for k, v in payload.items()}
+
+    if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(base_parts, payload, auth, is_patch=True):
+    if not check_validation(base_parts, normalized_patch, auth, is_patch=True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
     clean_path = "/".join(base_parts)
     del_paths = []
-    normalized_patch = {}
 
     async with db_lock:
         if_match = request.headers.get("if-match")
@@ -2472,20 +2227,18 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
             if generate_etag(current_data) != if_match:
                 raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
 
-        for rel_key, val in payload.items():
+        for rel_key, val in normalized_patch.items():
             rel_parts = [p for p in str(rel_key).strip("/").split("/") if p]
             target_parts = base_parts + rel_parts
             if not target_parts:
                 continue
-            norm_val = normalize_firebase_value(val)
-            normalized_patch[rel_key] = norm_val
-            if norm_val is None:
+            if val is None:
                 target = get_nested(DATABASE, target_parts)
                 if target is not None:
                     del_paths.extend(remove_associated_files(target))
                 delete_nested(DATABASE, target_parts)
             else:
-                set_nested(DATABASE, target_parts, norm_val)
+                set_nested(DATABASE, target_parts, val)
             invalidate_cache(target_parts)
 
         invalidate_cache(base_parts)
@@ -2508,20 +2261,20 @@ async def post_push_endpoint(full_path: str, request: Request, payload: Any = Bo
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     push_id = generate_push_id()
     target_parts = path_parts + [push_id]
-    norm_payload = normalize_firebase_value(payload)
+    cleaned_payload = normalize_firebase_data(payload)
 
-    if not check_write_permission(target_parts, norm_payload, auth, is_patch=False):
+    if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(target_parts, norm_payload, auth, is_patch=False):
+    if not check_validation(target_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
-    if norm_payload is not None:
-        clean_path = "/".join(target_parts)
+    clean_path = "/".join(target_parts)
+    if cleaned_payload is not None:
         async with db_lock:
-            set_nested(DATABASE, target_parts, norm_payload)
+            set_nested(DATABASE, target_parts, cleaned_payload)
             invalidate_cache(target_parts)
             await save_db()
-            await broadcast(clean_path, norm_payload, "put")
+            await broadcast(clean_path, cleaned_payload, "put")
 
     return {"name": push_id}
 
