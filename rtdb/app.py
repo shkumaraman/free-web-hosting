@@ -29,7 +29,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
 import opennsfw2 as n2
@@ -284,8 +284,12 @@ def _safe_backup_path(filename: str) -> str:
     return full_path
 
 
+def server_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def generate_push_id() -> str:
-    now_ms = int(time.time() * 1000)
+    now_ms = server_now_ms()
     time_chars = [""] * 8
     for i in range(7, -1, -1):
         time_chars[i] = PUSH_CHARS[now_ms % 64]
@@ -294,13 +298,43 @@ def generate_push_id() -> str:
     return "".join(time_chars) + rand_chars
 
 
+def _is_number(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
+def is_server_value(val: Any) -> bool:
+    return isinstance(val, dict) and len(val) == 1 and ".sv" in val
+
+
+def resolve_server_values(val: Any, existing: Any = None, now_ms: Optional[int] = None) -> Any:
+    if now_ms is None:
+        now_ms = server_now_ms()
+    if is_server_value(val):
+        spec = val[".sv"]
+        if spec == "timestamp":
+            return now_ms
+        if isinstance(spec, dict) and "increment" in spec:
+            delta = spec["increment"]
+            if _is_number(delta):
+                base = existing if _is_number(existing) else 0
+                return base + delta
+        return None
+    if isinstance(val, dict):
+        resolved = {}
+        for k, v in val.items():
+            child_existing = existing.get(str(k)) if isinstance(existing, dict) else None
+            resolved[k] = resolve_server_values(v, child_existing, now_ms)
+        return resolved
+    if isinstance(val, list):
+        items = []
+        for i, v in enumerate(val):
+            child_existing = existing.get(str(i)) if isinstance(existing, dict) else None
+            items.append(resolve_server_values(v, child_existing, now_ms))
+        return items
+    return val
+
+
 def normalize_firebase_data(val: Any) -> Any:
-    """
-    Firebase behavior:
-    - null (None) means delete / non-existent
-    - arrays (list) are stored as string-indexed objects {"0": ..., "1": ...}
-    - empty objects ({}) do not exist and collapse to None
-    """
     if val is None:
         return None
     if isinstance(val, list):
@@ -767,7 +801,7 @@ def eval_firebase_expr(
     transformed = "".join(parts)
 
     names = {
-        "now": int(time.time() * 1000),
+        "now": server_now_ms(),
         "data": RuleDataSnapshot(data_val, root_val, current_path),
         "newData": RuleDataSnapshot(new_data_val, new_root_val, current_path),
         "root": RuleDataSnapshot(root_val, root_val, []),
@@ -942,7 +976,9 @@ def get_index_configuration(path_parts: List[str]) -> Any:
 
 async def broadcast(path: str, value: Any, event_type: str = "put"):
     clean_target = path.strip("/")
-    raw_payload = json.dumps({"path": clean_target, "event": event_type, "data": value})
+    raw_payload = json.dumps(
+        {"path": clean_target, "event": event_type, "data": value, "serverTime": server_now_ms()}
+    )
     payload_bytes = len(raw_payload.encode("utf-8"))
     total_sent = 0
 
@@ -1176,7 +1212,7 @@ HTML_CONSOLE = """
                 </div>
                 <div>
                     <label class="block text-gray-600 font-medium mb-1">Value</label>
-                    <textarea id="input-val" rows="4" placeholder='Value (e.g. "Hello", 123, true, or {"title": "Hello"})' class="w-full bg-white border border-gray-300 rounded px-3 py-2 font-mono text-gray-800 text-xs focus:outline-blue-500"></textarea>
+                    <textarea id="input-val" rows="4" placeholder='Value (e.g. "Hello", 123, true, {"title": "Hello"} or {".sv": "timestamp"})' class="w-full bg-white border border-gray-300 rounded px-3 py-2 font-mono text-gray-800 text-xs focus:outline-blue-500"></textarea>
                 </div>
             </div>
             <div class="flex justify-end gap-2 mt-5 text-xs font-medium">
@@ -1407,6 +1443,7 @@ HTML_CONSOLE = """
             ws = new WebSocket(`${proto}//${window.location.host}/ws/`);
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
+                if (msg.event === 'time') return;
                 if (msg.event === 'connected') {
                     if (msg.data && Object.keys(msg.data).length > 0) { db = msg.data; renderTree(); }
                     else { refreshData(); }
@@ -1544,7 +1581,7 @@ HTML_CONSOLE = """
         }
 
         async function submitModal() {
-            const rawPath = document.getElementById('input-path').value.replace(/^\//, '');
+            const rawPath = document.getElementById('input-path').value.replace(/^\\//, '');
             const rawVal = document.getElementById('input-val').value.trim();
             let parsed;
             if (rawVal === '') {
@@ -1761,7 +1798,7 @@ async def upload_media_file(
         "content_type": file.content_type,
         "size": size,
         "is_public": public_bool,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": server_now_ms(),
     }
 
     path_parts = [p for p in target_path.strip("/").split("/") if p] + [push_id]
@@ -2036,6 +2073,37 @@ async def get_usage_metrics():
     }
 
 
+NO_STORE_HEADERS = {"Cache-Control": "no-store, max-age=0"}
+
+
+@app.get("/api/time")
+async def get_server_time(clientTime: Optional[int] = Query(None)):
+    now_ms = server_now_ms()
+    offset = (now_ms - clientTime) if clientTime is not None else 0
+    return JSONResponse(
+        {
+            "serverTime": now_ms,
+            "serverTimeOffset": offset,
+            "iso": datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(),
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
+@app.get("/.info/{info_path:path}")
+async def info_endpoint(info_path: str, clientTime: Optional[int] = Query(None)):
+    key = strip_json_suffix(info_path).strip("/")
+    now_ms = server_now_ms()
+    if key == "serverTime":
+        return JSONResponse(now_ms, headers=NO_STORE_HEADERS)
+    if key == "serverTimeOffset":
+        offset = (now_ms - clientTime) if clientTime is not None else 0
+        return JSONResponse(offset, headers=NO_STORE_HEADERS)
+    if key == "connected":
+        return JSONResponse(True, headers=NO_STORE_HEADERS)
+    raise HTTPException(status_code=404, detail="Unknown info path")
+
+
 @app.get("/{full_path:path}")
 async def read_endpoint(
     full_path: str,
@@ -2163,7 +2231,9 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    cleaned_payload = normalize_firebase_data(payload)
+    now_ms = server_now_ms()
+    resolved_payload = resolve_server_values(payload, get_nested(DATABASE, path_parts), now_ms)
+    cleaned_payload = normalize_firebase_data(resolved_payload)
 
     if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
@@ -2210,7 +2280,13 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     base_parts = [p for p in full_path.strip("/").split("/") if p]
-    normalized_patch = {str(k): normalize_firebase_data(v) for k, v in payload.items()}
+    now_ms = server_now_ms()
+
+    normalized_patch: Dict[str, Any] = {}
+    for k, v in payload.items():
+        rel_parts = [p for p in str(k).strip("/").split("/") if p]
+        existing = get_nested(DATABASE, base_parts + rel_parts)
+        normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
 
     if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
@@ -2261,7 +2337,8 @@ async def post_push_endpoint(full_path: str, request: Request, payload: Any = Bo
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     push_id = generate_push_id()
     target_parts = path_parts + [push_id]
-    cleaned_payload = normalize_firebase_data(payload)
+    resolved_payload = resolve_server_values(payload, None, server_now_ms())
+    cleaned_payload = normalize_firebase_data(resolved_payload)
 
     if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
@@ -2338,12 +2415,25 @@ async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
     async with db_lock:
         current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
         current_data_copy = copy.deepcopy(current_data)
-    conn_msg = json.dumps({"event": "connected", "path": clean_path, "data": current_data_copy})
+    conn_msg = json.dumps(
+        {"event": "connected", "path": clean_path, "data": current_data_copy, "serverTime": server_now_ms()}
+    )
     await websocket.send_text(conn_msg)
     sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8")))
     try:
         while True:
-            await websocket.receive_text()
+            raw_msg = await websocket.receive_text()
+            try:
+                msg = json.loads(raw_msg)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("type") == "time":
+                now_ms = server_now_ms()
+                client_time = msg.get("clientTime")
+                offset = (now_ms - client_time) if _is_number(client_time) else 0
+                await websocket.send_text(
+                    json.dumps({"event": "time", "serverTime": now_ms, "serverTimeOffset": offset})
+                )
     except (WebSocketDisconnect, Exception):
         active_websockets.discard(websocket)
         if clean_path in subscriptions and websocket in subscriptions[clean_path]:
