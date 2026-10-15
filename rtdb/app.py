@@ -608,6 +608,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag"],
 )
 
 
@@ -1802,14 +1803,15 @@ async def upload_media_file(
     }
 
     path_parts = [p for p in target_path.strip("/").split("/") if p] + [push_id]
-    if not check_write_permission(path_parts, record, auth):
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, record, auth):
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
+    async with db_lock:
+        if not check_write_permission(path_parts, record, auth):
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+        if not check_validation(path_parts, record, auth):
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
     is_hf_configured = bool(HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"))
     if is_hf_configured:
@@ -1832,6 +1834,16 @@ async def upload_media_file(
 
     clean_path = "/".join(path_parts)
     async with db_lock:
+        if not check_write_permission(path_parts, record, auth) or not check_validation(path_parts, record, auth):
+            if os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+            if is_hf_configured:
+                asyncio.create_task(run_cloud_delete(f"uploads/{saved_filename}"))
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission or validation failed")
+
         set_nested(DATABASE, path_parts, record)
         invalidate_cache(path_parts)
         await save_db()
@@ -1846,9 +1858,9 @@ async def upload_media_file(
 async def get_raw_data(request: Request, full_path: str = ""):
     auth = resolve_auth(request)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_read_permission(path_parts, auth):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     async with db_lock:
+        if not check_read_permission(path_parts, auth):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
         if not path_parts:
             return copy.deepcopy(DATABASE)
         data = get_nested(DATABASE, path_parts)
@@ -2120,20 +2132,20 @@ async def read_endpoint(
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_read_permission(path_parts, auth):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
     async with db_lock:
+        if not check_read_permission(path_parts, auth):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
         if not path_parts:
             data = copy.deepcopy(DATABASE)
         else:
             raw_data = get_nested(DATABASE, path_parts)
             data = copy.deepcopy(raw_data) if raw_data is not None else None
 
+    response.headers["ETag"] = generate_etag(data)
+
     if data is None:
         return None
-
-    response.headers["ETag"] = generate_etag(data)
 
     if shallow and isinstance(data, dict):
         return {k: True for k in data.keys()}
@@ -2227,37 +2239,35 @@ async def read_endpoint(
 
 @app.put("/{full_path:path}")
 @app.put("/")
-async def write_endpoint(request: Request, full_path: str = "", payload: Any = Body(None)):
+async def write_endpoint(request: Request, response: Response, full_path: str = "", payload: Any = Body(None)):
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    now_ms = server_now_ms()
-    resolved_payload = resolve_server_values(payload, get_nested(DATABASE, path_parts), now_ms)
-    cleaned_payload = normalize_firebase_data(resolved_payload)
-
-    if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(path_parts, cleaned_payload, auth, is_patch=False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-
     clean_path = "/".join(path_parts)
     del_paths = []
 
     async with db_lock:
+        current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
         if_match = request.headers.get("if-match")
-        if if_match:
-            current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
-            if generate_etag(current_data) != if_match:
-                raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
+        if if_match and generate_etag(current_data) != if_match:
+            raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
+
+        now_ms = server_now_ms()
+        resolved_payload = resolve_server_values(payload, current_data, now_ms)
+        cleaned_payload = normalize_firebase_data(resolved_payload)
+
+        if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+        if not check_validation(path_parts, cleaned_payload, auth, is_patch=False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
         if cleaned_payload is None:
             if not path_parts:
                 del_paths.extend(remove_associated_files(DATABASE))
                 DATABASE.clear()
             else:
-                target = get_nested(DATABASE, path_parts)
-                if target is not None:
-                    del_paths.extend(remove_associated_files(target))
+                if current_data is not None:
+                    del_paths.extend(remove_associated_files(current_data))
                 delete_nested(DATABASE, path_parts)
         else:
             set_nested(DATABASE, path_parts, cleaned_payload)
@@ -2265,6 +2275,7 @@ async def write_endpoint(request: Request, full_path: str = "", payload: Any = B
         invalidate_cache(path_parts)
         await save_db()
         await broadcast(clean_path, cleaned_payload, "delete" if cleaned_payload is None else "put")
+        response.headers["ETag"] = generate_etag(cleaned_payload)
 
     if del_paths:
         async def _del_files():
@@ -2280,28 +2291,26 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     base_parts = [p for p in full_path.strip("/").split("/") if p]
-    now_ms = server_now_ms()
-
-    normalized_patch: Dict[str, Any] = {}
-    for k, v in payload.items():
-        rel_parts = [p for p in str(k).strip("/").split("/") if p]
-        existing = get_nested(DATABASE, base_parts + rel_parts)
-        normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
-
-    if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(base_parts, normalized_patch, auth, is_patch=True):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-
     clean_path = "/".join(base_parts)
     del_paths = []
 
     async with db_lock:
+        current_data = get_nested(DATABASE, base_parts) if base_parts else DATABASE
         if_match = request.headers.get("if-match")
-        if if_match:
-            current_data = get_nested(DATABASE, base_parts) if base_parts else DATABASE
-            if generate_etag(current_data) != if_match:
-                raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
+        if if_match and generate_etag(current_data) != if_match:
+            raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
+
+        now_ms = server_now_ms()
+        normalized_patch: Dict[str, Any] = {}
+        for k, v in payload.items():
+            rel_parts = [p for p in str(k).strip("/").split("/") if p]
+            existing = get_nested(DATABASE, base_parts + rel_parts)
+            normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
+
+        if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+        if not check_validation(base_parts, normalized_patch, auth, is_patch=True):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
         for rel_key, val in normalized_patch.items():
             rel_parts = [p for p in str(rel_key).strip("/").split("/") if p]
@@ -2337,17 +2346,18 @@ async def post_push_endpoint(full_path: str, request: Request, payload: Any = Bo
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     push_id = generate_push_id()
     target_parts = path_parts + [push_id]
-    resolved_payload = resolve_server_values(payload, None, server_now_ms())
-    cleaned_payload = normalize_firebase_data(resolved_payload)
-
-    if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-    if not check_validation(target_parts, cleaned_payload, auth, is_patch=False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
-
     clean_path = "/".join(target_parts)
-    if cleaned_payload is not None:
-        async with db_lock:
+
+    async with db_lock:
+        resolved_payload = resolve_server_values(payload, None, server_now_ms())
+        cleaned_payload = normalize_firebase_data(resolved_payload)
+
+        if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+        if not check_validation(target_parts, cleaned_payload, auth, is_patch=False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
+
+        if cleaned_payload is not None:
             set_nested(DATABASE, target_parts, cleaned_payload)
             invalidate_cache(target_parts)
             await save_db()
@@ -2362,10 +2372,7 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
     auth = resolve_auth(request) if request is not None else None
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if not check_write_permission(path_parts, None, auth, is_patch=False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
     clean_path = "/".join(path_parts)
-
     del_paths = []
 
     async with db_lock:
@@ -2375,6 +2382,9 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
                 current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
                 if generate_etag(current_data) != if_match:
                     raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
+
+        if not check_write_permission(path_parts, None, auth, is_patch=False):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
         if not path_parts:
             del_paths.extend(remove_associated_files(DATABASE))
