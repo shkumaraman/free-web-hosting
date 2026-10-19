@@ -1,11 +1,13 @@
 fastapi
 uvicorn[standard]
 python-multipart
-requests
-Pillow
 simpleeval
 PyJWT
 opennsfw2
-tf-keras
+Pillow
 tensorflow-cpu
+tf-keras
 huggingface_hub[hf_transfer]
+fsspec
+orjson
+requests
