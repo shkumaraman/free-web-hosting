@@ -1,17 +1,20 @@
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import ast
 import asyncio
-import copy
 import hashlib
 import json
 import mimetypes
-import os
 import random
 import re
 import time
-import traceback
 import types
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from fastapi import (
@@ -29,20 +32,29 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
-import opennsfw2 as n2
+try:
+    import orjson
+except Exception:
+    orjson = None
 
 try:
     import jwt as pyjwt
 except Exception:
     pyjwt = None
 
+_n2_model = None
+_hf_fs = None
+_nsfw_sem = asyncio.Semaphore(1)
+_last_prune_hour = ""
+
 HF_TOKEN = os.getenv("HF_TOKEN")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 CLOUD_SYNC_LOCK = asyncio.Lock()
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.88"))
 
 AUTH_SECRET = os.getenv("AUTH_SECRET")
 AUTH_ALGORITHM = os.getenv("AUTH_ALGORITHM", "HS256")
@@ -56,9 +68,13 @@ db_lock = asyncio.Lock()
 
 subscriptions: Dict[str, List[WebSocket]] = {}
 active_websockets = set()
+ws_disconnect_ops: Dict[WebSocket, Dict[str, tuple]] = {}
+broadcast_queue: Optional[asyncio.Queue] = None
+
 STORAGE_BYTES = 0
 METRICS_DIRTY = False
 DB_DIRTY = False
+PULL_OK = False
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "./data")
 RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
@@ -78,6 +94,30 @@ except Exception:
     pass
 
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+ATTACHMENT_EXTS = {".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".swf"}
+
+
+def dumps_bytes(obj: Any) -> bytes:
+    if orjson is not None:
+        return orjson.dumps(obj)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def dumps_str(obj: Any, indent: Optional[int] = None) -> str:
+    if indent is None and orjson is not None:
+        return orjson.dumps(obj).decode("utf-8")
+    if indent is None:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, indent=indent, ensure_ascii=False)
+
+
+def jresp(obj: Any, status_code: int = 200, headers: Optional[Dict[str, str]] = None) -> Response:
+    return Response(
+        content=dumps_bytes(obj),
+        status_code=status_code,
+        media_type="application/json",
+        headers=headers,
+    )
 
 
 class AuthContext:
@@ -135,15 +175,28 @@ def resolve_auth_ws(websocket: WebSocket) -> Optional[AuthContext]:
 def generate_etag(data: Any) -> str:
     if data is None:
         return '"null"'
-    return '"' + hashlib.md5(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest() + '"'
+    if orjson is not None:
+        raw = orjson.dumps(data, option=orjson.OPT_SORT_KEYS)
+    else:
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return '"' + hashlib.md5(raw).hexdigest() + '"'
+
+
+def wants_etag(request: Request) -> bool:
+    h = request.headers
+    return bool(h.get("if-match") or h.get("if-none-match") or h.get("x-firebase-etag"))
 
 
 def get_hf_fs():
+    global _hf_fs
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
         return None
+    if _hf_fs is not None:
+        return _hf_fs
     try:
         from huggingface_hub import HfFileSystem
-        return HfFileSystem(token=HF_TOKEN)
+        _hf_fs = HfFileSystem(token=HF_TOKEN)
+        return _hf_fs
     except Exception:
         return None
 
@@ -181,26 +234,30 @@ async def run_cloud_delete(relative_path: str):
     await asyncio.to_thread(_delete_sync, relative_path)
 
 
-async def run_state_sync(direction: str):
+async def run_state_sync(direction: str, files_to_push: Optional[List[str]] = None):
+    global PULL_OK
     if not HF_TOKEN or HF_TOKEN.startswith("hf_YOUR"):
+        PULL_OK = True
         return
 
     def _sync():
+        global PULL_OK
         fs = get_hf_fs()
         if not fs:
             return
         base_remote = f"hf://buckets/{BUCKET_NAME}"
-        state_files = ["db.json", "rules.json", "metrics.json"]
+        state_files = files_to_push or ["db.json", "rules.json", "metrics.json"]
 
         if direction == "pull":
-            for sf in state_files:
+            pull_succeeded = True
+            for sf in ["db.json", "rules.json", "metrics.json"]:
                 rf = f"{base_remote}/{sf}"
                 lf = os.path.join(STORAGE_DIR, sf)
                 try:
                     if fs.exists(rf):
                         fs.get_file(rf, lf)
                 except Exception:
-                    pass
+                    pull_succeeded = False
 
             remote_backups = f"{base_remote}/backups"
             try:
@@ -208,12 +265,18 @@ async def run_state_sync(direction: str):
                     backup_files = fs.ls(remote_backups, detail=False)
                     for rbf in backup_files:
                         fname = os.path.basename(rbf)
-                        if fname.endswith(".json"):
-                            fs.get_file(rbf, os.path.join(BACKUPS_DIR, fname))
+                        local_bf = os.path.join(BACKUPS_DIR, fname)
+                        if fname.endswith(".json") and not os.path.exists(local_bf):
+                            fs.get_file(rbf, local_bf)
             except Exception:
                 pass
 
+            if pull_succeeded:
+                PULL_OK = True
+
         elif direction == "push":
+            if not PULL_OK:
+                return
             for sf in state_files:
                 lf = os.path.join(STORAGE_DIR, sf)
                 rf = f"{base_remote}/{sf}"
@@ -223,16 +286,6 @@ async def run_state_sync(direction: str):
                     except Exception:
                         pass
 
-            if os.path.isdir(BACKUPS_DIR):
-                for bf in os.listdir(BACKUPS_DIR):
-                    if bf.endswith(".json"):
-                        lbf = os.path.join(BACKUPS_DIR, bf)
-                        rbf = f"{base_remote}/backups/{bf}"
-                        try:
-                            fs.put_file(lbf, rbf)
-                        except Exception:
-                            pass
-
     try:
         async with CLOUD_SYNC_LOCK:
             await asyncio.to_thread(_sync)
@@ -241,16 +294,19 @@ async def run_state_sync(direction: str):
 
 
 def check_nsfw_image(file_path: str) -> bool:
+    global _n2_model
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
         return False
     try:
-        nsfw_prob = n2.predict_image(file_path)
-        if nsfw_prob >= 0.75:
-            return True
-    except Exception:
+        if _n2_model is None:
+            import opennsfw2 as n2
+            _n2_model = n2
+        nsfw_prob = float(_n2_model.predict_image(file_path))
+        return nsfw_prob >= NSFW_THRESHOLD
+    except Exception as e:
+        print("NSFW check failed, blocking:", repr(e))
         return True
-    return False
 
 
 def strip_json_suffix(path: str) -> str:
@@ -259,11 +315,11 @@ def strip_json_suffix(path: str) -> str:
     return path
 
 
-def _atomic_write_text(path: str, text: str):
+def _atomic_write_bytes(path: str, data: bytes):
     tmp_path = f"{path}.tmp-{os.getpid()}-{random.randint(0, 999999)}"
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(text)
+        with open(tmp_path, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
@@ -273,6 +329,11 @@ def _atomic_write_text(path: str, text: str):
                 os.remove(tmp_path)
             except Exception:
                 pass
+        raise
+
+
+def _atomic_write_text(path: str, text: str):
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _safe_backup_path(filename: str) -> str:
@@ -358,8 +419,21 @@ def get_nested(data: dict, path_parts: List[str]) -> Any:
     return current
 
 
+def _with_set(node: Any, parts: List[str], val: Any) -> Any:
+    if not parts:
+        return val
+    new_node = dict(node) if isinstance(node, dict) else {}
+    head = parts[0]
+    sub = _with_set(new_node.get(head), parts[1:], val)
+    if sub is None:
+        new_node.pop(head, None)
+    else:
+        new_node[head] = sub
+    return new_node if new_node else None
+
+
 class RuleDataSnapshot:
-    def __init__(self, value: Any, root_val: Any = None, path: List[str] = None):
+    def __init__(self, value: Any, root_val: Any = None, path: Optional[List[str]] = None):
         self._value = value
         self._root = root_val if root_val is not None else value
         self._path = path or []
@@ -387,7 +461,7 @@ class RuleDataSnapshot:
         if not self._path:
             return self
         parent_path = self._path[:-1]
-        parent_val = get_nested(self._root, parent_path)
+        parent_val = get_nested(self._root, parent_path) if isinstance(self._root, dict) else None
         return RuleDataSnapshot(parent_val, self._root, parent_path)
 
     def hasChild(self, path: str) -> bool:
@@ -399,7 +473,7 @@ class RuleDataSnapshot:
         if keys is None:
             return len(self._value) > 0
         if isinstance(keys, (list, tuple)):
-            return all(k in self._value for k in keys)
+            return all(str(k) in self._value for k in keys)
         return False
 
     def isString(self) -> bool:
@@ -412,23 +486,44 @@ class RuleDataSnapshot:
         return isinstance(self._value, bool)
 
     def contains(self, sub: Any) -> bool:
-        if isinstance(self._value, (str, list)):
-            return str(sub) in self._value
-        if isinstance(self._value, dict):
+        if isinstance(self._value, (str, list, dict)):
             return str(sub) in self._value
         return False
 
     def beginsWith(self, prefix: Any) -> bool:
         return isinstance(self._value, str) and self._value.startswith(str(prefix))
 
+    def endsWith(self, suffix: Any) -> bool:
+        return isinstance(self._value, str) and self._value.endswith(str(suffix))
+
+    def replace(self, old: Any, new: Any) -> str:
+        if not isinstance(self._value, str):
+            return ""
+        return self._value.replace(str(old), str(new))
+
+    def toLowerCase(self) -> str:
+        return self._value.lower() if isinstance(self._value, str) else ""
+
+    def toUpperCase(self) -> str:
+        return self._value.upper() if isinstance(self._value, str) else ""
+
     def matches(self, pattern: Any) -> bool:
         if not isinstance(self._value, str):
             return False
         try:
             pat_str = str(pattern)
-            if pat_str.startswith("/") and pat_str.endswith("/"):
-                pat_str = pat_str[1:-1]
-            return bool(re.search(pat_str, self._value))
+            flags = 0
+            if pat_str.startswith("/") and pat_str.rfind("/") > 0:
+                last_slash = pat_str.rfind("/")
+                flag_str = pat_str[last_slash + 1 :]
+                pat_str = pat_str[1:last_slash]
+                if "i" in flag_str:
+                    flags |= re.IGNORECASE
+                if "m" in flag_str:
+                    flags |= re.MULTILINE
+                if "s" in flag_str:
+                    flags |= re.DOTALL
+            return bool(re.search(pat_str, self._value, flags))
         except Exception:
             return False
 
@@ -451,20 +546,65 @@ class SafeRuleEval(EvalWithCompoundTypes):
         "isBoolean",
         "contains",
         "beginsWith",
+        "endsWith",
+        "replace",
+        "toLowerCase",
+        "toUpperCase",
         "matches",
         "length",
     }
 
+    def _eval_attribute(self, node):
+        obj = self._eval(node.value)
+        if node.attr == "length":
+            if isinstance(obj, RuleDataSnapshot):
+                return obj.length()
+            if isinstance(obj, (str, list, dict)):
+                return len(obj)
+            return 0
+        return super()._eval_attribute(node)
+
     def _eval_call(self, node):
         if isinstance(node.func, ast.Attribute):
-            if node.func.attr in self.ALLOWED_METHODS:
+            attr = node.func.attr
+            if attr in self.ALLOWED_METHODS:
                 obj = self._eval(node.func.value)
-                if isinstance(obj, RuleDataSnapshot):
-                    method = getattr(obj, node.func.attr)
-                    args = [self._eval(a) for a in node.args]
-                    return method(*args)
-            raise FeatureNotAvailable(f"Method '{node.func.attr}' is not permitted")
+                if not isinstance(obj, RuleDataSnapshot):
+                    obj = RuleDataSnapshot(obj)
+                method = getattr(obj, attr)
+                args = [self._eval(a) for a in node.args]
+                return method(*args)
+            raise FeatureNotAvailable(f"Method '{attr}' is not permitted")
         return super()._eval_call(node)
+
+
+@lru_cache(maxsize=2048)
+def _transform_rule_expr(expr: str) -> str:
+    expr = re.sub(
+        r"\.matches\(\s*(/(?:\\.|[^/\\\r\n])+/[gimsuy]*)\s*\)",
+        lambda m: f".matches({json.dumps(m.group(1))})",
+        expr.strip(),
+    )
+    parts = re.split(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', expr)
+    for i in range(0, len(parts), 2):
+        s = parts[i]
+        while True:
+            prev = s
+            s = re.sub(r"\(([^\(\)?:]+)\s*\?\s*([^\(\)?:]+)\s*:\s*([^\(\)?:]+)\)", r"(\2 if \1 else \3)", s)
+            s = re.sub(r"([^\(\)?:]+)\s*\?\s*([^\(\)?:]+)\s*:\s*([^\(\)?:]+)", r"(\2 if \1 else \3)", s)
+            if s == prev:
+                break
+        s = re.sub(r"===", "==", s)
+        s = re.sub(r"!==", "!=", s)
+        s = re.sub(r"&&", " and ", s)
+        s = re.sub(r"\|\|", " or ", s)
+        s = re.sub(r"(?<![!=<>])!(?![=])", " not ", s)
+        s = re.sub(r"\btrue\b", "True", s)
+        s = re.sub(r"\bfalse\b", "False", s)
+        s = re.sub(r"\bnull\b", "None", s)
+        s = re.sub(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", r"\1", s)
+        parts[i] = s
+    return "".join(parts)
 
 
 def load_rules():
@@ -485,17 +625,21 @@ def load_rules():
                 pass
 
     RULES = {"rules": {".read": True, ".write": True}}
-    _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
+    try:
+        _atomic_write_text(RULES_FILE, dumps_str(RULES, indent=2))
+    except Exception:
+        pass
 
 
 def load_database():
     if os.path.exists(DB_FILE):
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
+            with open(DB_FILE, "rb") as f:
                 content = f.read().strip()
                 if content:
                     DATABASE.clear()
-                    loaded = normalize_firebase_data(json.loads(content))
+                    raw = orjson.loads(content) if orjson is not None else json.loads(content.decode("utf-8"))
+                    loaded = normalize_firebase_data(raw)
                     if isinstance(loaded, dict):
                         DATABASE.update(loaded)
         except Exception:
@@ -519,12 +663,25 @@ def load_metrics():
     METRICS = {"days": {}, "hours": {}}
 
 
-def save_metrics():
-    _atomic_write_text(METRICS_FILE, json.dumps(METRICS, indent=2))
+def save_metrics_sync():
+    try:
+        _atomic_write_bytes(METRICS_FILE, dumps_bytes(METRICS))
+    except Exception:
+        pass
+
+
+def _write_db_sync(snapshot_bytes: bytes) -> bool:
+    global STORAGE_BYTES
+    try:
+        _atomic_write_bytes(DB_FILE, snapshot_bytes)
+        STORAGE_BYTES = len(snapshot_bytes)
+        return True
+    except Exception:
+        return False
 
 
 def sync_metrics(bandwidth_bytes: int = 0):
-    global METRICS_DIRTY
+    global METRICS_DIRTY, _last_prune_hour
     now = datetime.now(timezone.utc)
     day_str = now.strftime("%Y-%m-%d")
     hour_str = now.strftime("%Y-%m-%d %H:00")
@@ -554,54 +711,179 @@ def sync_metrics(bandwidth_bytes: int = 0):
         METRICS["days"][day_str]["peak_connections"] = curr_conns
     if curr_conns > METRICS["hours"][hour_str].get("peak_connections", 0):
         METRICS["hours"][hour_str]["peak_connections"] = curr_conns
-    cutoff_h = (now - timedelta(hours=36)).strftime("%Y-%m-%d %H:00")
-    METRICS["hours"] = {k: v for k, v in METRICS["hours"].items() if k >= cutoff_h}
-    cutoff_d = (now - timedelta(days=60)).strftime("%Y-%m-%d")
-    METRICS["days"] = {k: v for k, v in METRICS["days"].items() if k >= cutoff_d}
+    if hour_str != _last_prune_hour:
+        cutoff_h = (now - timedelta(hours=36)).strftime("%Y-%m-%d %H:00")
+        METRICS["hours"] = {k: v for k, v in METRICS["hours"].items() if k >= cutoff_h}
+        cutoff_d = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+        METRICS["days"] = {k: v for k, v in METRICS["days"].items() if k >= cutoff_d}
+        _last_prune_hour = hour_str
     METRICS_DIRTY = True
 
 
-async def state_flusher():
+async def flush_now():
     global METRICS_DIRTY, DB_DIRTY
+    files_to_push = []
+    if DB_DIRTY:
+        DB_DIRTY = False
+        ok = await asyncio.to_thread(_write_db_sync, dumps_bytes(DATABASE))
+        if ok:
+            files_to_push.append("db.json")
+        else:
+            DB_DIRTY = True
+    if METRICS_DIRTY:
+        METRICS_DIRTY = False
+        await asyncio.to_thread(save_metrics_sync)
+        files_to_push.append("metrics.json")
+    if files_to_push:
+        await run_state_sync("push", files_to_push=files_to_push)
+
+
+async def state_flusher():
     while True:
-        await asyncio.sleep(10)
-        should_push = False
-        if METRICS_DIRTY:
-            await asyncio.to_thread(save_metrics)
-            METRICS_DIRTY = False
-            should_push = True
-        if DB_DIRTY:
-            DB_DIRTY = False
-            should_push = True
-        if should_push:
-            await run_state_sync("push")
+        await asyncio.sleep(5)
+        try:
+            await flush_now()
+        except Exception:
+            pass
+
+
+async def _send_ws_safe(ws: WebSocket, text: str) -> bool:
+    try:
+        await asyncio.wait_for(ws.send_text(text), timeout=2.0)
+        return True
+    except Exception:
+        return False
+
+
+async def broadcaster_worker():
+    global broadcast_queue
+    while True:
+        item = await broadcast_queue.get()
+        if item is None:
+            break
+        clean_target, value, event_type, ts = item
+        target_parts = [p for p in clean_target.split("/") if p] if clean_target else []
+        total_sent = 0
+        dead: List[tuple] = []
+        send_coros = []
+        send_meta = []
+
+        for sub_path, sockets in list(subscriptions.items()):
+            if not sockets:
+                continue
+            sub_parts = [p for p in sub_path.split("/") if p] if sub_path else []
+            if clean_target == sub_path or sub_path == "":
+                rel_path = clean_target if sub_path == "" else ""
+                payload_str = dumps_str(
+                    {"path": rel_path, "event": event_type, "data": value, "serverTime": ts}
+                )
+            elif clean_target.startswith(sub_path + "/"):
+                rel_path = clean_target[len(sub_path) + 1 :]
+                payload_str = dumps_str(
+                    {"path": rel_path, "event": event_type, "data": value, "serverTime": ts}
+                )
+            elif sub_path.startswith(clean_target + "/") or clean_target == "":
+                rel_parts = sub_parts[len(target_parts) :]
+                if event_type == "patch" and isinstance(value, dict):
+                    sub_data = get_nested(DATABASE, sub_parts)
+                elif isinstance(value, dict):
+                    sub_data = get_nested(value, rel_parts)
+                else:
+                    sub_data = None
+                payload_str = dumps_str(
+                    {"path": "", "event": "put" if sub_data is not None else "delete", "data": sub_data, "serverTime": ts}
+                )
+            else:
+                continue
+
+            p_bytes = len(payload_str.encode("utf-8"))
+            for ws in list(sockets):
+                send_coros.append(_send_ws_safe(ws, payload_str))
+                send_meta.append((sub_path, ws, p_bytes))
+
+        if send_coros:
+            results = await asyncio.gather(*send_coros)
+            for (sub_path, ws, p_bytes), ok in zip(send_meta, results):
+                if ok:
+                    total_sent += p_bytes
+                else:
+                    dead.append((sub_path, ws))
+
+        for sub_path, ws in dead:
+            active_websockets.discard(ws)
+            if sub_path in subscriptions and ws in subscriptions[sub_path]:
+                subscriptions[sub_path].remove(ws)
+
+        if total_sent > 0:
+            sync_metrics(bandwidth_bytes=total_sent)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global STORAGE_BYTES, broadcast_queue
+    broadcast_queue = asyncio.Queue(maxsize=5000)
     await run_state_sync("pull")
-    global STORAGE_BYTES
     load_rules()
     load_database()
     load_metrics()
-    STORAGE_BYTES = len(json.dumps(DATABASE).encode("utf-8"))
+    STORAGE_BYTES = len(dumps_bytes(DATABASE))
 
     flusher_task = asyncio.create_task(state_flusher())
+    broadcaster_task = asyncio.create_task(broadcaster_worker())
     try:
         yield
     finally:
         flusher_task.cancel()
+        if broadcast_queue is not None:
+            await broadcast_queue.put(None)
         try:
             await flusher_task
         except asyncio.CancelledError:
             pass
-        if METRICS_DIRTY:
-            await asyncio.to_thread(save_metrics)
-        await run_state_sync("push")
+        try:
+            await broadcaster_task
+        except Exception:
+            pass
+        await flush_now()
+
+
+class BandwidthASGIMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        track = (
+            not path.startswith("/api/usage")
+            and not path.startswith("/_admin")
+            and not path.startswith("/uploads")
+        )
+        if not track:
+            await self.app(scope, receive, send)
+            return
+
+        sent_bytes = 0
+
+        async def send_wrapper(message):
+            nonlocal sent_bytes
+            if message["type"] == "http.response.body":
+                body = message.get("body", b"")
+                if body:
+                    sent_bytes += len(body)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+        if sent_bytes > 0:
+            sync_metrics(bandwidth_bytes=sent_bytes)
 
 
 app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
+app.add_middleware(BandwidthASGIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -612,41 +894,19 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def bandwidth_tracker(request: Request, call_next):
-    response = await call_next(request)
-    if (
-        not request.url.path.startswith("/api/usage")
-        and not request.url.path.startswith("/_admin")
-        and not request.url.path.startswith("/uploads")
-    ):
-        content_length = response.headers.get("content-length")
-        if content_length and content_length.isdigit():
-            sync_metrics(bandwidth_bytes=int(content_length))
-    return response
-
-
-def _write_db_sync():
-    global STORAGE_BYTES
-    data_str = json.dumps(DATABASE, indent=2)
-    _atomic_write_text(DB_FILE, data_str)
-    STORAGE_BYTES = len(data_str.encode("utf-8"))
-
-
 async def save_db():
     global DB_DIRTY
-    await asyncio.to_thread(_write_db_sync)
-    sync_metrics()
     DB_DIRTY = True
+    sync_metrics()
 
 
 def _write_rules_sync():
-    _atomic_write_text(RULES_FILE, json.dumps(RULES, indent=2))
+    _atomic_write_text(RULES_FILE, dumps_str(RULES, indent=2))
 
 
 async def save_rules_file():
     await asyncio.to_thread(_write_rules_sync)
-    asyncio.create_task(run_state_sync("push"))
+    asyncio.create_task(run_state_sync("push", files_to_push=["rules.json"]))
 
 
 def delete_nested(data: dict, path_parts: List[str]) -> bool:
@@ -691,10 +951,14 @@ def invalidate_cache(path_parts: List[str]):
     path = "/".join(path_parts)
     if not path:
         INDEX_CACHE.clear()
+        if len(INDEX_CACHE) > 50:
+            INDEX_CACHE.clear()
         return
     keys_to_del = [k for k in INDEX_CACHE if k == path or k.startswith(path + "/") or path.startswith(k + "/")]
     for k in keys_to_del:
         del INDEX_CACHE[k]
+    if len(INDEX_CACHE) > 50:
+        INDEX_CACHE.clear()
 
 
 def find_file_record_paths(node: Any, clean_name: str, current_path: Optional[List[str]] = None) -> List[List[str]]:
@@ -702,7 +966,7 @@ def find_file_record_paths(node: Any, clean_name: str, current_path: Optional[Li
         current_path = []
     matched_paths: List[List[str]] = []
     if isinstance(node, dict):
-        if node.get("filename") == clean_name:
+        if node.get("filename") == clean_name and isinstance(node.get("url"), str) and "/uploads/" in node["url"]:
             matched_paths.append(current_path)
         else:
             for k, v in node.items():
@@ -719,7 +983,10 @@ def remove_associated_files(node: Any) -> List[str]:
         if (
             "filename" in node
             and isinstance(node["filename"], str)
-            and any(k in node for k in ("id", "content_type", "url", "timestamp"))
+            and isinstance(node.get("url"), str)
+            and f"/uploads/{os.path.basename(node['filename'])}" in node["url"]
+            and "id" in node
+            and "timestamp" in node
         ):
             fname = os.path.basename(node["filename"])
             fpath = os.path.join(UPLOADS_DIR, fname)
@@ -738,7 +1005,7 @@ def remove_associated_files(node: Any) -> List[str]:
 
 
 def _build_post_write_root(path_parts: List[str], new_payload: Any, is_patch: bool = False) -> Any:
-    virtual = copy.deepcopy(DATABASE)
+    virtual: Any = DATABASE
     if is_patch and isinstance(new_payload, dict):
         for rel_key, val in new_payload.items():
             rel_parts = [p for p in str(rel_key).strip("/").split("/") if p]
@@ -746,10 +1013,7 @@ def _build_post_write_root(path_parts: List[str], new_payload: Any, is_patch: bo
             if not full_parts:
                 continue
             cleaned_val = normalize_firebase_data(val)
-            if cleaned_val is None:
-                delete_nested(virtual, full_parts)
-            else:
-                set_nested(virtual, full_parts, cleaned_val)
+            virtual = _with_set(virtual, full_parts, cleaned_val) or {}
         return virtual
 
     cleaned_payload = normalize_firebase_data(new_payload)
@@ -757,11 +1021,7 @@ def _build_post_write_root(path_parts: List[str], new_payload: Any, is_patch: bo
         if isinstance(cleaned_payload, dict):
             return cleaned_payload
         return {"data": cleaned_payload} if cleaned_payload is not None else {}
-    if cleaned_payload is None:
-        delete_nested(virtual, path_parts)
-    else:
-        set_nested(virtual, path_parts, cleaned_payload)
-    return virtual
+    return _with_set(virtual, path_parts, cleaned_payload) or {}
 
 
 def eval_firebase_expr(
@@ -772,34 +1032,14 @@ def eval_firebase_expr(
     auth: Optional[AuthContext] = None,
     root_val: Any = None,
     new_root_val: Any = None,
-    current_path: List[str] = None
+    current_path: Optional[List[str]] = None,
 ) -> bool:
     if isinstance(expr, bool):
         return expr
     if not isinstance(expr, str):
         return False
 
-    parts = re.split(r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')', expr.strip())
-    for i in range(0, len(parts), 2):
-        s = parts[i]
-        while True:
-            prev = s
-            s = re.sub(r"\(([^\(\)?:]+)\s*\?\s*([^\(\)?:]+)\s*:\s*([^\(\)?:]+)\)", r"(\2 if \1 else \3)", s)
-            s = re.sub(r"([^\(\)?:]+)\s*\?\s*([^\(\)?:]+)\s*:\s*([^\(\)?:]+)", r"(\2 if \1 else \3)", s)
-            if s == prev:
-                break
-        s = re.sub(r"===", "==", s)
-        s = re.sub(r"!==", "!=", s)
-        s = re.sub(r"&&", " and ", s)
-        s = re.sub(r"\|\|", " or ", s)
-        s = re.sub(r"(?<![!=<>])!(?![=])", " not ", s)
-        s = re.sub(r"\btrue\b", "True", s)
-        s = re.sub(r"\bfalse\b", "False", s)
-        s = re.sub(r"\bnull\b", "None", s)
-        s = re.sub(r"([a-zA-Z0-9_\$\.\(\)]+)\.length\b", r"len(\1)", s)
-        s = re.sub(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", r"\1", s)
-        parts[i] = s
-    transformed = "".join(parts)
+    transformed = _transform_rule_expr(expr)
 
     names = {
         "now": server_now_ms(),
@@ -846,7 +1086,9 @@ def check_read_permission(path_parts: List[str], auth: Optional[AuthContext] = N
         if matched_key:
             current_rule = current_rule[matched_key]
             if isinstance(current_rule, dict) and ".read" in current_rule:
-                if eval_firebase_expr(current_rule[".read"], data_val, None, wildcards, auth, root_val, root_val, current_sub_path):
+                if eval_firebase_expr(
+                    current_rule[".read"], data_val, None, wildcards, auth, root_val, root_val, current_sub_path
+                ):
                     return True
         else:
             break
@@ -854,16 +1096,23 @@ def check_read_permission(path_parts: List[str], auth: Optional[AuthContext] = N
 
 
 def check_write_permission(
-    path_parts: List[str], new_payload: Any, auth: Optional[AuthContext] = None, is_patch: bool = False
+    path_parts: List[str],
+    new_payload: Any,
+    auth: Optional[AuthContext] = None,
+    is_patch: bool = False,
+    new_root_val: Any = None,
 ) -> bool:
     current_rule = RULES.get("rules", {})
     wildcards: Dict[str, str] = {}
     existing_val = get_nested(DATABASE, path_parts) if path_parts else DATABASE
     root_val = DATABASE
-    new_root_val = _build_post_write_root(path_parts, new_payload, is_patch=is_patch)
+    if new_root_val is None:
+        new_root_val = _build_post_write_root(path_parts, new_payload, is_patch=is_patch)
     target_new_root = get_nested(new_root_val, path_parts) if path_parts else (new_root_val or None)
     if ".write" in current_rule:
-        if eval_firebase_expr(current_rule[".write"], existing_val, target_new_root, wildcards, auth, root_val, new_root_val, path_parts):
+        if eval_firebase_expr(
+            current_rule[".write"], existing_val, target_new_root, wildcards, auth, root_val, new_root_val, path_parts
+        ):
             return True
     for i, part in enumerate(path_parts):
         if not isinstance(current_rule, dict):
@@ -884,7 +1133,14 @@ def check_write_permission(
             if isinstance(current_rule, dict) and ".write" in current_rule:
                 target_new = get_nested(new_root_val, current_sub_path)
                 if eval_firebase_expr(
-                    current_rule[".write"], data_val, target_new, wildcards, auth, root_val, new_root_val, current_sub_path
+                    current_rule[".write"],
+                    data_val,
+                    target_new,
+                    wildcards,
+                    auth,
+                    root_val,
+                    new_root_val,
+                    current_sub_path,
                 ):
                     return True
         else:
@@ -899,18 +1155,21 @@ def validate_rules_recursively(
     auth: Optional[AuthContext] = None,
     root_val: Any = None,
     new_root_val: Any = None,
-    current_path: List[str] = None
+    current_path: Optional[List[str]] = None,
 ) -> bool:
     if not isinstance(rule_node, dict) or data_node is None:
         return True
     if ".validate" in rule_node:
         expr = rule_node[".validate"]
-        if not eval_firebase_expr(expr, None, data_node, wildcards, auth, root_val, new_root_val, current_path):
+        existing_node = get_nested(root_val, current_path) if (isinstance(root_val, dict) and current_path) else None
+        if not eval_firebase_expr(
+            expr, existing_node, data_node, wildcards, auth, root_val, new_root_val, current_path
+        ):
             return False
     if isinstance(data_node, dict):
         for k, v in data_node.items():
             matched_rule = None
-            next_wildcards = copy.copy(wildcards)
+            next_wildcards = dict(wildcards)
             if k in rule_node:
                 matched_rule = rule_node[k]
             else:
@@ -921,18 +1180,25 @@ def validate_rules_recursively(
                         break
             if matched_rule and isinstance(matched_rule, dict):
                 next_path = (current_path or []) + [str(k)]
-                if not validate_rules_recursively(matched_rule, v, next_wildcards, auth, root_val, new_root_val, next_path):
+                if not validate_rules_recursively(
+                    matched_rule, v, next_wildcards, auth, root_val, new_root_val, next_path
+                ):
                     return False
     return True
 
 
 def check_validation(
-    path_parts: List[str], new_payload: Any, auth: Optional[AuthContext] = None, is_patch: bool = False
+    path_parts: List[str],
+    new_payload: Any,
+    auth: Optional[AuthContext] = None,
+    is_patch: bool = False,
+    new_root_val: Any = None,
 ) -> bool:
     current_rule = RULES.get("rules", {})
     wildcards: Dict[str, str] = {}
     root_val = DATABASE
-    new_root_val = _build_post_write_root(path_parts, new_payload, is_patch=is_patch)
+    if new_root_val is None:
+        new_root_val = _build_post_write_root(path_parts, new_payload, is_patch=is_patch)
     for part in path_parts:
         if not isinstance(current_rule, dict):
             return True
@@ -950,7 +1216,9 @@ def check_validation(
         else:
             return True
     target_payload = get_nested(new_root_val, path_parts) if path_parts else (new_root_val or None)
-    return validate_rules_recursively(current_rule, target_payload, wildcards, auth, root_val, new_root_val, path_parts)
+    return validate_rules_recursively(
+        current_rule, target_payload, wildcards, auth, root_val, new_root_val, path_parts
+    )
 
 
 def get_index_configuration(path_parts: List[str]) -> Any:
@@ -975,44 +1243,115 @@ def get_index_configuration(path_parts: List[str]) -> Any:
     return None
 
 
+def _firebase_sort_key(val: Any) -> tuple:
+    if val is None:
+        return (0, 0)
+    if isinstance(val, bool):
+        return (1, 1 if val else 0)
+    if isinstance(val, (int, float)):
+        return (2, float(val))
+    if isinstance(val, str):
+        return (3, val)
+    return (4, dumps_str(val))
+
+
 async def broadcast(path: str, value: Any, event_type: str = "put"):
-    clean_target = path.strip("/")
-    raw_payload = json.dumps(
-        {"path": clean_target, "event": event_type, "data": value, "serverTime": server_now_ms()}
-    )
-    payload_bytes = len(raw_payload.encode("utf-8"))
-    total_sent = 0
+    if broadcast_queue is not None:
+        try:
+            broadcast_queue.put_nowait((path.strip("/"), value, event_type, server_now_ms()))
+        except asyncio.QueueFull:
+            pass
 
-    tasks = []
-    for sub_path, sockets in list(subscriptions.items()):
-        if (
-            clean_target == sub_path
-            or clean_target.startswith(sub_path + "/")
-            or sub_path.startswith(clean_target + "/")
-            or sub_path == ""
-        ):
-            for ws in sockets:
-                tasks.append((sub_path, ws))
 
-    if not tasks:
+async def execute_disconnect_ops(ops_map: Dict[str, tuple], auth: Optional[AuthContext]):
+    if not ops_map:
         return
+    broadcasts = []
+    del_paths = []
+    db_changed = False
 
-    results = await asyncio.gather(*(t[1].send_text(raw_payload) for t in tasks), return_exceptions=True)
-    websockets_to_remove = []
+    async with db_lock:
+        now_ms = server_now_ms()
+        for target_clean, (action, payload) in ops_map.items():
+            path_parts = [p for p in target_clean.strip("/").split("/") if p]
+            if action == "put":
+                current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
+                resolved = resolve_server_values(payload, current_data, now_ms)
+                cleaned = normalize_firebase_data(resolved)
+                new_root = _build_post_write_root(path_parts, cleaned, is_patch=False)
+                if not check_write_permission(path_parts, cleaned, auth, is_patch=False, new_root_val=new_root):
+                    continue
+                if not check_validation(path_parts, cleaned, auth, is_patch=False, new_root_val=new_root):
+                    continue
+                if cleaned is None:
+                    if not path_parts:
+                        del_paths.extend(remove_associated_files(DATABASE))
+                        DATABASE.clear()
+                    else:
+                        if current_data is not None:
+                            del_paths.extend(remove_associated_files(current_data))
+                        delete_nested(DATABASE, path_parts)
+                else:
+                    set_nested(DATABASE, path_parts, cleaned)
+                invalidate_cache(path_parts)
+                db_changed = True
+                broadcasts.append((target_clean, cleaned, "delete" if cleaned is None else "put"))
 
-    for (sub_path, ws), res in zip(tasks, results):
-        if isinstance(res, Exception):
-            websockets_to_remove.append((sub_path, ws))
-        else:
-            total_sent += payload_bytes
+            elif action == "patch" and isinstance(payload, dict):
+                normalized_patch: Dict[str, Any] = {}
+                for k, v in payload.items():
+                    rel_parts = [p for p in str(k).strip("/").split("/") if p]
+                    existing = get_nested(DATABASE, path_parts + rel_parts)
+                    normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
+                new_root = _build_post_write_root(path_parts, normalized_patch, is_patch=True)
+                if not check_write_permission(path_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
+                    continue
+                if not check_validation(path_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
+                    continue
+                for rel_key, val in normalized_patch.items():
+                    rel_parts = [p for p in str(rel_key).strip("/").split("/") if p]
+                    t_parts = path_parts + rel_parts
+                    if not t_parts:
+                        continue
+                    if val is None:
+                        target = get_nested(DATABASE, t_parts)
+                        if target is not None:
+                            del_paths.extend(remove_associated_files(target))
+                        delete_nested(DATABASE, t_parts)
+                    else:
+                        set_nested(DATABASE, t_parts, val)
+                    invalidate_cache(t_parts)
+                invalidate_cache(path_parts)
+                db_changed = True
+                broadcasts.append((target_clean, normalized_patch, "patch"))
 
-    for sub_path, ws in websockets_to_remove:
-        active_websockets.discard(ws)
-        if sub_path in subscriptions and ws in subscriptions[sub_path]:
-            subscriptions[sub_path].remove(ws)
+            elif action == "delete":
+                new_root = _build_post_write_root(path_parts, None, is_patch=False)
+                if not check_write_permission(path_parts, None, auth, is_patch=False, new_root_val=new_root):
+                    continue
+                if not path_parts:
+                    del_paths.extend(remove_associated_files(DATABASE))
+                    DATABASE.clear()
+                else:
+                    target = get_nested(DATABASE, path_parts)
+                    if target is not None:
+                        del_paths.extend(remove_associated_files(target))
+                    delete_nested(DATABASE, path_parts)
+                invalidate_cache(path_parts)
+                db_changed = True
+                broadcasts.append((target_clean, None, "delete"))
 
-    if total_sent > 0:
-        sync_metrics(bandwidth_bytes=total_sent)
+        if db_changed:
+            await save_db()
+
+    for b_path, b_val, b_evt in broadcasts:
+        await broadcast(b_path, b_val, b_evt)
+
+    if del_paths:
+        async def _del_files():
+            for p in set(del_paths):
+                await run_cloud_delete(p)
+        asyncio.create_task(_del_files())
 
 
 HTML_CONSOLE = """
@@ -1056,7 +1395,7 @@ HTML_CONSOLE = """
                 <span id="base-endpoint" class="font-medium text-gray-800 select-all">https://.../</span>
             </div>
             <button id="copy-btn" onclick="copyUrl()" title="Copy URL" class="ml-2 text-gray-400 hover:text-gray-700 shrink-0">
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
             </button>
         </div>
         <div class="flex items-center gap-2 shrink-0">
@@ -1226,6 +1565,7 @@ HTML_CONSOLE = """
     <script>
         let db = {};
         let ws = null;
+        let pingInterval = null;
         let modalMode = 'add';
         let usageData = null;
         let activeMetric = 'downloads';
@@ -1439,18 +1779,58 @@ HTML_CONSOLE = """
             pt.classList.remove('hidden');
         }
 
+        function applyLocalDelta(path, event, data) {
+            const parts = path ? path.split('/').filter(Boolean) : [];
+            if (event === 'delete' || data === null || data === undefined) {
+                if (parts.length === 0) { db = {}; return; }
+                let curr = db;
+                for (let i = 0; i < parts.length - 1; i++) {
+                    if (!curr || typeof curr !== 'object') return;
+                    curr = curr[parts[i]];
+                }
+                if (curr && typeof curr === 'object') delete curr[parts[parts.length - 1]];
+            } else if (event === 'put') {
+                if (parts.length === 0) { db = data || {}; return; }
+                let curr = db;
+                for (let i = 0; i < parts.length - 1; i++) {
+                    if (!curr[parts[i]] || typeof curr[parts[i]] !== 'object') curr[parts[i]] = {};
+                    curr = curr[parts[i]];
+                }
+                curr[parts[parts.length - 1]] = data;
+            } else if (event === 'patch' && data && typeof data === 'object') {
+                Object.keys(data).forEach(k => {
+                    const subPath = path ? `${path}/${k}` : k;
+                    applyLocalDelta(subPath, data[k] === null ? 'delete' : 'put', data[k]);
+                });
+            }
+        }
+
         function initWebSocket() {
             const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${window.location.host}/ws/`);
+            ws.onopen = () => {
+                if (pingInterval) clearInterval(pingInterval);
+                pingInterval = setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 25000);
+            };
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
-                if (msg.event === 'time') return;
+                if (msg.event === 'time' || msg.event === 'pong' || msg.event === 'ping' || msg.event === 'onDisconnectAck') return;
                 if (msg.event === 'connected') {
-                    if (msg.data && Object.keys(msg.data).length > 0) { db = msg.data; renderTree(); }
-                    else { refreshData(); }
-                } else { refreshData(); }
+                    db = msg.data || {};
+                    renderTree();
+                } else {
+                    applyLocalDelta(msg.path || '', msg.event, msg.data);
+                    renderTree();
+                }
             };
-            ws.onclose = () => { setTimeout(initWebSocket, 2500); };
+            ws.onclose = () => {
+                if (pingInterval) clearInterval(pingInterval);
+                setTimeout(initWebSocket, 2500);
+            };
         }
 
         async function refreshData() {
@@ -1614,8 +1994,6 @@ HTML_CONSOLE = """
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
                     alert('Delete failed: ' + (err.detail || 'Permission denied'));
-                } else {
-                    refreshData();
                 }
             }
         }
@@ -1646,12 +2024,10 @@ HTML_CONSOLE = """
                 const res = await fetch('/.json', { method: 'DELETE' });
                 if (!res.ok) {
                     alert('Failed to clear database: Permission denied');
-                } else {
-                    refreshData();
                 }
             }
         }
-        refreshData(); initWebSocket();
+        initWebSocket();
     </script>
 </body>
 </html>
@@ -1666,30 +2042,33 @@ async def serve_dashboard():
 @app.get("/uploads/{filename:path}")
 async def serve_upload_file(filename: str):
     clean_name = os.path.basename(filename)
+    ext = os.path.splitext(clean_name)[1].lower()
     fpath = os.path.join(UPLOADS_DIR, clean_name)
 
+    headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if ext in ATTACHMENT_EXTS:
+        headers["Content-Disposition"] = f'attachment; filename="{clean_name}"'
+
     if os.path.isfile(fpath):
-        return FileResponse(fpath)
+        return FileResponse(fpath, headers=headers)
 
-    def _fetch_from_hf():
-        fs = get_hf_fs()
-        if not fs:
-            return None, None
+    fs = get_hf_fs()
+    if fs:
         remote_path = f"hf://buckets/{BUCKET_NAME}/uploads/{clean_name}"
-        try:
-            if fs.exists(remote_path):
-                content_type, _ = mimetypes.guess_type(clean_name)
-                content_type = content_type or "application/octet-stream"
-                with fs.open(remote_path, "rb") as remote_file:
-                    data = remote_file.read()
-                return data, content_type
-        except Exception:
-            pass
-        return None, None
+        exists = await asyncio.to_thread(fs.exists, remote_path)
+        if exists:
+            content_type, _ = mimetypes.guess_type(clean_name)
+            content_type = content_type or "application/octet-stream"
 
-    data, media_type = await asyncio.to_thread(_fetch_from_hf)
-    if data is not None:
-        return Response(content=data, media_type=media_type)
+            def _iter_remote():
+                with fs.open(remote_path, "rb") as rf:
+                    while chunk := rf.read(256 * 1024):
+                        yield chunk
+
+            return StreamingResponse(_iter_remote(), media_type=content_type, headers=headers)
 
     raise HTTPException(status_code=404, detail="File not found")
 
@@ -1704,6 +2083,7 @@ async def delete_upload_file(filename: str, request: Request):
     if not clean_name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid filename")
 
+    db_changed = False
     async with db_lock:
         matched_paths = find_file_record_paths(DATABASE, clean_name)
         paths_to_check = matched_paths if matched_paths else [["uploads", os.path.splitext(clean_name)[0]]]
@@ -1712,7 +2092,6 @@ async def delete_upload_file(filename: str, request: Request):
             if not check_write_permission(p_parts, None, auth, is_patch=False):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
-        db_changed = False
         for p_parts in matched_paths:
             if delete_nested(DATABASE, p_parts):
                 invalidate_cache(p_parts)
@@ -1721,7 +2100,9 @@ async def delete_upload_file(filename: str, request: Request):
         if db_changed:
             invalidate_cache([])
             await save_db()
-            await broadcast("", DATABASE, "put")
+
+    if db_changed:
+        await broadcast("", DATABASE, "put")
 
     fpath = os.path.join(UPLOADS_DIR, clean_name)
     if os.path.isfile(fpath):
@@ -1773,7 +2154,8 @@ async def upload_media_file(
     public_bool = is_public.lower() in ("true", "1", "yes")
 
     if public_bool:
-        is_nsfw = await asyncio.to_thread(check_nsfw_image, dest_path)
+        async with _nsfw_sem:
+            is_nsfw = await asyncio.to_thread(check_nsfw_image, dest_path)
         if is_nsfw:
             if os.path.exists(dest_path):
                 try:
@@ -1804,11 +2186,12 @@ async def upload_media_file(
 
     path_parts = [p for p in target_path.strip("/").split("/") if p] + [push_id]
     async with db_lock:
-        if not check_write_permission(path_parts, record, auth):
+        new_root = _build_post_write_root(path_parts, record, is_patch=False)
+        if not check_write_permission(path_parts, record, auth, new_root_val=new_root):
             if os.path.exists(dest_path):
                 os.remove(dest_path)
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not check_validation(path_parts, record, auth):
+        if not check_validation(path_parts, record, auth, new_root_val=new_root):
             if os.path.exists(dest_path):
                 os.remove(dest_path)
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
@@ -1834,7 +2217,10 @@ async def upload_media_file(
 
     clean_path = "/".join(path_parts)
     async with db_lock:
-        if not check_write_permission(path_parts, record, auth) or not check_validation(path_parts, record, auth):
+        new_root = _build_post_write_root(path_parts, record, is_patch=False)
+        if not check_write_permission(path_parts, record, auth, new_root_val=new_root) or not check_validation(
+            path_parts, record, auth, new_root_val=new_root
+        ):
             if os.path.exists(dest_path):
                 try:
                     os.remove(dest_path)
@@ -1847,9 +2233,9 @@ async def upload_media_file(
         set_nested(DATABASE, path_parts, record)
         invalidate_cache(path_parts)
         await save_db()
-        await broadcast(clean_path, record, "put")
 
-    return {"status": "success", "path": clean_path, "data": record}
+    await broadcast(clean_path, record, "put")
+    return jresp({"status": "success", "path": clean_path, "data": record})
 
 
 @app.get("/api-data")
@@ -1858,19 +2244,18 @@ async def upload_media_file(
 async def get_raw_data(request: Request, full_path: str = ""):
     auth = resolve_auth(request)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    async with db_lock:
-        if not check_read_permission(path_parts, auth):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not path_parts:
-            return copy.deepcopy(DATABASE)
-        data = get_nested(DATABASE, path_parts)
-        return copy.deepcopy(data) if data is not None else {}
+    if not check_read_permission(path_parts, auth):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    if not path_parts:
+        return jresp(DATABASE)
+    data = get_nested(DATABASE, path_parts)
+    return jresp(data if data is not None else {})
 
 
 @app.get("/_admin/rules")
 async def get_rules():
     load_rules()
-    return RULES
+    return jresp(RULES)
 
 
 @app.post("/_admin/rules")
@@ -1878,7 +2263,7 @@ async def update_rules(new_rules: Dict[str, Any] = Body(...)):
     global RULES
     RULES = new_rules
     await save_rules_file()
-    return {"status": "success", "rules": RULES}
+    return jresp({"status": "success", "rules": RULES})
 
 
 @app.get("/_admin/backups")
@@ -1932,13 +2317,9 @@ async def make_backup():
     filename = f"backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     dest = _safe_backup_path(filename)
     async with db_lock:
-        data_str = json.dumps(DATABASE, indent=2)
-        await asyncio.to_thread(_atomic_write_text, dest, data_str)
-
-    pushed = await push_single_file_to_hf(dest, f"backups/{filename}")
-    if not pushed:
-        asyncio.create_task(run_state_sync("push"))
-
+        snapshot_bytes = dumps_bytes(DATABASE)
+    await asyncio.to_thread(_atomic_write_bytes, dest, snapshot_bytes)
+    await push_single_file_to_hf(dest, f"backups/{filename}")
     return {"status": "created", "filename": filename}
 
 
@@ -1949,7 +2330,7 @@ async def restore_backup(filename: str):
         def _fetch_backup():
             fs = get_hf_fs()
             if fs:
-                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{filename}"
+                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{os.path.basename(filename)}"
                 try:
                     if fs.exists(remote_path):
                         fs.get_file(remote_path, src)
@@ -1961,8 +2342,9 @@ async def restore_backup(filename: str):
         raise HTTPException(status_code=404, detail="Backup file not found")
 
     def _read():
-        with open(src, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(src, "rb") as f:
+            raw = f.read()
+            return orjson.loads(raw) if orjson is not None else json.loads(raw.decode("utf-8"))
 
     data = normalize_firebase_data(await asyncio.to_thread(_read))
     async with db_lock:
@@ -1971,7 +2353,8 @@ async def restore_backup(filename: str):
             DATABASE.update(data)
         invalidate_cache([])
         await save_db()
-        await broadcast("", DATABASE, "put")
+    await flush_now()
+    await broadcast("", DATABASE, "put")
     return {"status": "restored"}
 
 
@@ -1982,7 +2365,7 @@ async def download_backup(filename: str):
         def _fetch_backup():
             fs = get_hf_fs()
             if fs:
-                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{filename}"
+                remote_path = f"hf://buckets/{BUCKET_NAME}/backups/{os.path.basename(filename)}"
                 try:
                     if fs.exists(remote_path):
                         fs.get_file(remote_path, fp)
@@ -2120,7 +2503,6 @@ async def info_endpoint(info_path: str, clientTime: Optional[int] = Query(None))
 async def read_endpoint(
     full_path: str,
     request: Request,
-    response: Response,
     shallow: bool = False,
     orderBy: Optional[str] = Query(None),
     equalTo: Optional[str] = Query(None),
@@ -2133,22 +2515,23 @@ async def read_endpoint(
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
 
-    async with db_lock:
-        if not check_read_permission(path_parts, auth):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not path_parts:
-            data = copy.deepcopy(DATABASE)
-        else:
-            raw_data = get_nested(DATABASE, path_parts)
-            data = copy.deepcopy(raw_data) if raw_data is not None else None
+    if not check_read_permission(path_parts, auth):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
+    data = DATABASE if not path_parts else get_nested(DATABASE, path_parts)
 
-    response.headers["ETag"] = generate_etag(data)
+    headers = {}
+    if wants_etag(request):
+        etag = generate_etag(data)
+        headers["ETag"] = etag
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match and if_none_match == etag:
+            return Response(status_code=304, headers=headers)
 
     if data is None:
-        return None
+        return jresp(None, headers=headers)
 
     if shallow and isinstance(data, dict):
-        return {k: True for k in data.keys()}
+        return jresp({k: True for k in data.keys()}, headers=headers)
 
     if orderBy and isinstance(data, dict):
         clean_order_by = orderBy.strip('"\'')
@@ -2191,11 +2574,7 @@ async def read_endpoint(
                         item_val = None
                     temp_list.append((item_val, k, v))
 
-                try:
-                    temp_list.sort(key=lambda x: (x[0] is None, x[0]))
-                except TypeError:
-                    temp_list.sort(key=lambda x: (x[0] is None, str(x[0])))
-
+                temp_list.sort(key=lambda x: (_firebase_sort_key(x[0]), str(x[1])))
                 INDEX_CACHE[path_key][clean_order_by] = temp_list
 
             sorted_data = INDEX_CACHE[path_key][clean_order_by]
@@ -2212,18 +2591,18 @@ async def read_endpoint(
                     item_val = None
                 sorted_data.append((item_val, k, v))
 
-            try:
-                sorted_data.sort(key=lambda x: (x[0] is None, x[0]))
-            except TypeError:
-                sorted_data.sort(key=lambda x: (x[0] is None, str(x[0])))
+            sorted_data.sort(key=lambda x: (_firebase_sort_key(x[0]), str(x[1])))
+
+        st_key = _firebase_sort_key(st_val) if st_val is not None else None
+        ed_key = _firebase_sort_key(ed_val) if ed_val is not None else None
 
         filtered_list = []
         for item_val, k, v in sorted_data:
             if eq_val is not None and item_val != eq_val:
                 continue
-            if st_val is not None and (item_val is None or item_val < st_val):
+            if st_key is not None and _firebase_sort_key(item_val) < st_key:
                 continue
-            if ed_val is not None and (item_val is None or item_val > ed_val):
+            if ed_key is not None and _firebase_sort_key(item_val) > ed_key:
                 continue
             filtered_list.append((k, v))
 
@@ -2232,19 +2611,20 @@ async def read_endpoint(
         elif limitToLast and limitToLast > 0:
             filtered_list = filtered_list[-limitToLast:]
 
-        return {k: v for k, v in filtered_list}
+        return jresp({k: v for k, v in filtered_list}, headers=headers)
 
-    return data
+    return jresp(data, headers=headers)
 
 
 @app.put("/{full_path:path}")
 @app.put("/")
-async def write_endpoint(request: Request, response: Response, full_path: str = "", payload: Any = Body(None)):
+async def write_endpoint(request: Request, full_path: str = "", payload: Any = Body(None)):
     auth = resolve_auth(request)
     full_path = strip_json_suffix(full_path)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
     clean_path = "/".join(path_parts)
     del_paths = []
+    headers = {}
 
     async with db_lock:
         current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
@@ -2255,10 +2635,11 @@ async def write_endpoint(request: Request, response: Response, full_path: str = 
         now_ms = server_now_ms()
         resolved_payload = resolve_server_values(payload, current_data, now_ms)
         cleaned_payload = normalize_firebase_data(resolved_payload)
+        new_root = _build_post_write_root(path_parts, cleaned_payload, is_patch=False)
 
-        if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False):
+        if not check_write_permission(path_parts, cleaned_payload, auth, is_patch=False, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not check_validation(path_parts, cleaned_payload, auth, is_patch=False):
+        if not check_validation(path_parts, cleaned_payload, auth, is_patch=False, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
         if cleaned_payload is None:
@@ -2274,8 +2655,10 @@ async def write_endpoint(request: Request, response: Response, full_path: str = 
 
         invalidate_cache(path_parts)
         await save_db()
-        await broadcast(clean_path, cleaned_payload, "delete" if cleaned_payload is None else "put")
-        response.headers["ETag"] = generate_etag(cleaned_payload)
+        if wants_etag(request):
+            headers["ETag"] = generate_etag(cleaned_payload)
+
+    await broadcast(clean_path, cleaned_payload, "delete" if cleaned_payload is None else "put")
 
     if del_paths:
         async def _del_files():
@@ -2283,7 +2666,7 @@ async def write_endpoint(request: Request, response: Response, full_path: str = 
                 await run_cloud_delete(p)
         asyncio.create_task(_del_files())
 
-    return cleaned_payload
+    return jresp(cleaned_payload, headers=headers)
 
 
 @app.patch("/{full_path:path}")
@@ -2307,9 +2690,10 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
             existing = get_nested(DATABASE, base_parts + rel_parts)
             normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
 
-        if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True):
+        new_root = _build_post_write_root(base_parts, normalized_patch, is_patch=True)
+        if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not check_validation(base_parts, normalized_patch, auth, is_patch=True):
+        if not check_validation(base_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
         for rel_key, val in normalized_patch.items():
@@ -2328,7 +2712,8 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
 
         invalidate_cache(base_parts)
         await save_db()
-        await broadcast(clean_path, normalized_patch, "patch")
+
+    await broadcast(clean_path, normalized_patch, "patch")
 
     if del_paths:
         async def _del_files():
@@ -2336,7 +2721,7 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
                 await run_cloud_delete(p)
         asyncio.create_task(_del_files())
 
-    return normalized_patch
+    return jresp(normalized_patch)
 
 
 @app.post("/{full_path:path}")
@@ -2347,23 +2732,28 @@ async def post_push_endpoint(full_path: str, request: Request, payload: Any = Bo
     push_id = generate_push_id()
     target_parts = path_parts + [push_id]
     clean_path = "/".join(target_parts)
+    did_write = False
 
     async with db_lock:
         resolved_payload = resolve_server_values(payload, None, server_now_ms())
         cleaned_payload = normalize_firebase_data(resolved_payload)
+        new_root = _build_post_write_root(target_parts, cleaned_payload, is_patch=False)
 
-        if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False):
+        if not check_write_permission(target_parts, cleaned_payload, auth, is_patch=False, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
-        if not check_validation(target_parts, cleaned_payload, auth, is_patch=False):
+        if not check_validation(target_parts, cleaned_payload, auth, is_patch=False, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Validation failed")
 
         if cleaned_payload is not None:
             set_nested(DATABASE, target_parts, cleaned_payload)
             invalidate_cache(target_parts)
             await save_db()
-            await broadcast(clean_path, cleaned_payload, "put")
+            did_write = True
 
-    return {"name": push_id}
+    if did_write:
+        await broadcast(clean_path, cleaned_payload, "put")
+
+    return jresp({"name": push_id})
 
 
 @app.delete("/{full_path:path}")
@@ -2383,7 +2773,8 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
                 if generate_etag(current_data) != if_match:
                     raise HTTPException(status_code=412, detail="Precondition Failed (ETag mismatch)")
 
-        if not check_write_permission(path_parts, None, auth, is_patch=False):
+        new_root = _build_post_write_root(path_parts, None, is_patch=False)
+        if not check_write_permission(path_parts, None, auth, is_patch=False, new_root_val=new_root):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permission denied")
 
         if not path_parts:
@@ -2397,7 +2788,8 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
 
         invalidate_cache(path_parts)
         await save_db()
-        await broadcast(clean_path, None, "delete")
+
+    await broadcast(clean_path, None, "delete")
 
     if del_paths:
         async def _del_files():
@@ -2405,7 +2797,7 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
                 await run_cloud_delete(p)
         asyncio.create_task(_del_files())
 
-    return {"status": "deleted", "path": clean_path}
+    return jresp({"status": "deleted", "path": clean_path})
 
 
 @app.websocket("/ws/{full_path:path}")
@@ -2413,43 +2805,90 @@ async def delete_endpoint(full_path: str = "", request: Request = None):
 async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
     auth = resolve_auth_ws(websocket)
     path_parts = [p for p in full_path.strip("/").split("/") if p]
-    if path_parts and not check_read_permission(path_parts, auth):
+    if not check_read_permission(path_parts, auth):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     await websocket.accept()
     active_websockets.add(websocket)
+    ws_disconnect_ops[websocket] = {}
     clean_path = "/".join(path_parts)
     if clean_path not in subscriptions:
         subscriptions[clean_path] = []
     subscriptions[clean_path].append(websocket)
-    async with db_lock:
-        current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
-        current_data_copy = copy.deepcopy(current_data)
-    conn_msg = json.dumps(
-        {"event": "connected", "path": clean_path, "data": current_data_copy, "serverTime": server_now_ms()}
+    current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
+    conn_msg = dumps_str(
+        {"event": "connected", "path": clean_path, "data": current_data, "serverTime": server_now_ms()}
     )
-    await websocket.send_text(conn_msg)
+    await _send_ws_safe(websocket, conn_msg)
     sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8")))
     try:
         while True:
-            raw_msg = await websocket.receive_text()
+            try:
+                raw_msg = await asyncio.wait_for(websocket.receive_text(), timeout=45.0)
+            except asyncio.TimeoutError:
+                ping_ok = await _send_ws_safe(
+                    websocket, dumps_str({"event": "ping", "serverTime": server_now_ms()})
+                )
+                if not ping_ok:
+                    break
+                continue
+
             try:
                 msg = json.loads(raw_msg)
             except Exception:
                 continue
-            if isinstance(msg, dict) and msg.get("type") == "time":
-                now_ms = server_now_ms()
-                client_time = msg.get("clientTime")
-                offset = (now_ms - client_time) if _is_number(client_time) else 0
-                await websocket.send_text(
-                    json.dumps({"event": "time", "serverTime": now_ms, "serverTimeOffset": offset})
-                )
+            if isinstance(msg, dict):
+                msg_type = msg.get("type")
+                if msg_type == "ping":
+                    await _send_ws_safe(websocket, dumps_str({"event": "pong", "serverTime": server_now_ms()}))
+                elif msg_type == "time":
+                    now_ms = server_now_ms()
+                    client_time = msg.get("clientTime")
+                    offset = (now_ms - client_time) if _is_number(client_time) else 0
+                    await _send_ws_safe(
+                        websocket,
+                        dumps_str({"event": "time", "serverTime": now_ms, "serverTimeOffset": offset}),
+                    )
+                elif msg_type in ("onDisconnectPut", "onDisconnectPatch", "onDisconnectDelete", "onDisconnectCancel"):
+                    raw_target = msg.get("path")
+                    if raw_target is None:
+                        target_clean = clean_path
+                    else:
+                        rel_clean = strip_json_suffix(str(raw_target)).strip("/")
+                        if str(raw_target).startswith("/"):
+                            target_clean = rel_clean
+                        else:
+                            target_clean = f"{clean_path}/{rel_clean}".strip("/") if clean_path else rel_clean
+
+                    ops = ws_disconnect_ops.setdefault(websocket, {})
+                    if msg_type == "onDisconnectCancel":
+                        ops.pop(target_clean, None)
+                    elif msg_type == "onDisconnectPut":
+                        ops[target_clean] = ("put", msg.get("data"))
+                    elif msg_type == "onDisconnectPatch":
+                        if isinstance(msg.get("data"), dict):
+                            ops[target_clean] = ("patch", msg.get("data"))
+                    elif msg_type == "onDisconnectDelete":
+                        ops[target_clean] = ("delete", None)
+
+                    await _send_ws_safe(
+                        websocket,
+                        dumps_str({"event": "onDisconnectAck", "type": msg_type, "path": target_clean}),
+                    )
     except (WebSocketDisconnect, Exception):
+        pass
+    finally:
         active_websockets.discard(websocket)
         if clean_path in subscriptions and websocket in subscriptions[clean_path]:
             subscriptions[clean_path].remove(websocket)
             if not subscriptions[clean_path]:
                 del subscriptions[clean_path]
+        pending_ops = ws_disconnect_ops.pop(websocket, {})
+        if pending_ops:
+            try:
+                await execute_disconnect_ops(pending_ops, auth)
+            except Exception:
+                pass
         sync_metrics()
 
 
