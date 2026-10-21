@@ -97,18 +97,40 @@ PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 ATTACHMENT_EXTS = {".html", ".htm", ".svg", ".xml", ".xhtml", ".js", ".mjs", ".swf"}
 
 
+def _clean_str(val: str) -> str:
+    try:
+        val.encode("utf-8")
+        return val
+    except UnicodeEncodeError:
+        return val.encode("utf-8", "replace").decode("utf-8")
+
+
 def dumps_bytes(obj: Any) -> bytes:
     if orjson is not None:
-        return orjson.dumps(obj)
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        try:
+            return orjson.dumps(obj)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "replace")
+    except Exception:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def dumps_str(obj: Any, indent: Optional[int] = None) -> str:
     if indent is None and orjson is not None:
-        return orjson.dumps(obj).decode("utf-8")
-    if indent is None:
-        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-    return json.dumps(obj, indent=indent, ensure_ascii=False)
+        try:
+            return orjson.dumps(obj).decode("utf-8")
+        except (TypeError, ValueError):
+            pass
+    try:
+        if indent is None:
+            return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        return json.dumps(obj, indent=indent, ensure_ascii=False)
+    except Exception:
+        if indent is None:
+            return json.dumps(obj, separators=(",", ":"), ensure_ascii=True)
+        return json.dumps(obj, indent=indent, ensure_ascii=True)
 
 
 def jresp(obj: Any, status_code: int = 200, headers: Optional[Dict[str, str]] = None) -> Response:
@@ -175,10 +197,17 @@ def resolve_auth_ws(websocket: WebSocket) -> Optional[AuthContext]:
 def generate_etag(data: Any) -> str:
     if data is None:
         return '"null"'
+    raw = None
     if orjson is not None:
-        raw = orjson.dumps(data, option=orjson.OPT_SORT_KEYS)
-    else:
-        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        try:
+            raw = orjson.dumps(data, option=orjson.OPT_SORT_KEYS)
+        except (TypeError, ValueError):
+            raw = None
+    if raw is None:
+        try:
+            raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "replace")
+        except Exception:
+            raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     return '"' + hashlib.md5(raw).hexdigest() + '"'
 
 
@@ -383,8 +412,9 @@ def resolve_server_values(val: Any, existing: Any = None, now_ms: Optional[int] 
     if isinstance(val, dict):
         resolved = {}
         for k, v in val.items():
-            child_existing = existing.get(str(k)) if isinstance(existing, dict) else None
-            resolved[k] = resolve_server_values(v, child_existing, now_ms)
+            clean_k = _clean_str(str(k)) if isinstance(k, str) else str(k)
+            child_existing = existing.get(clean_k) if isinstance(existing, dict) else None
+            resolved[clean_k] = resolve_server_values(v, child_existing, now_ms)
         return resolved
     if isinstance(val, list):
         items = []
@@ -398,14 +428,17 @@ def resolve_server_values(val: Any, existing: Any = None, now_ms: Optional[int] 
 def normalize_firebase_data(val: Any) -> Any:
     if val is None:
         return None
+    if isinstance(val, str):
+        return _clean_str(val)
     if isinstance(val, list):
         val = {str(i): v for i, v in enumerate(val)}
     if isinstance(val, dict):
         cleaned = {}
         for k, v in val.items():
+            clean_k = _clean_str(str(k)) if isinstance(k, str) else str(k)
             nv = normalize_firebase_data(v)
             if nv is not None:
-                cleaned[str(k)] = nv
+                cleaned[clean_k] = nv
         return cleaned if cleaned else None
     return val
 
@@ -611,9 +644,7 @@ def load_rules():
     global RULES
     candidates = [
         RULES_FILE,
-        os.path.join(STORAGE_DIR, "rules.json"),
         "rules.json",
-        "./rules.json",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -638,7 +669,10 @@ def load_database():
                 content = f.read().strip()
                 if content:
                     DATABASE.clear()
-                    raw = orjson.loads(content) if orjson is not None else json.loads(content.decode("utf-8"))
+                    try:
+                        raw = orjson.loads(content) if orjson is not None else json.loads(content.decode("utf-8", "replace"))
+                    except Exception:
+                        raw = json.loads(content.decode("utf-8", "replace"))
                     loaded = normalize_firebase_data(raw)
                     if isinstance(loaded, dict):
                         DATABASE.update(loaded)
@@ -796,7 +830,7 @@ async def broadcaster_worker():
             else:
                 continue
 
-            p_bytes = len(payload_str.encode("utf-8"))
+            p_bytes = len(payload_str.encode("utf-8", "replace"))
             for ws in list(sockets):
                 send_coros.append(_send_ws_safe(ws, payload_str))
                 send_meta.append((sub_path, ws, p_bytes))
@@ -951,8 +985,6 @@ def invalidate_cache(path_parts: List[str]):
     path = "/".join(path_parts)
     if not path:
         INDEX_CACHE.clear()
-        if len(INDEX_CACHE) > 50:
-            INDEX_CACHE.clear()
         return
     keys_to_del = [k for k in INDEX_CACHE if k == path or k.startswith(path + "/") or path.startswith(k + "/")]
     for k in keys_to_del:
@@ -1302,7 +1334,7 @@ async def execute_disconnect_ops(ops_map: Dict[str, tuple], auth: Optional[AuthC
                 for k, v in payload.items():
                     rel_parts = [p for p in str(k).strip("/").split("/") if p]
                     existing = get_nested(DATABASE, path_parts + rel_parts)
-                    normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
+                    normalized_patch[_clean_str(str(k))] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
                 new_root = _build_post_write_root(path_parts, normalized_patch, is_patch=True)
                 if not check_write_permission(path_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
                     continue
@@ -1470,7 +1502,7 @@ HTML_CONSOLE = """
         <div id="tab-usage" class="hidden min-h-full max-w-lg space-y-3">
             <div class="relative inline-block text-left">
                 <button onclick="togglePeriodDropdown()" class="flex items-center gap-2 text-xs font-medium text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-md shadow-xs">
-                    <svg class="w-3.5 h-3.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                    <svg class="w-3.5 h-3.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z"/></svg>
                     <span id="selected-period-label">Daily (Last 24 hours)</span>
                     <svg class="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
                 </button>
@@ -1602,7 +1634,7 @@ HTML_CONSOLE = """
             if (btn) {
                 btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
                 setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
                 }, 1500);
             }
         }
@@ -2688,7 +2720,7 @@ async def patch_endpoint(full_path: str, request: Request, payload: Dict[str, An
         for k, v in payload.items():
             rel_parts = [p for p in str(k).strip("/").split("/") if p]
             existing = get_nested(DATABASE, base_parts + rel_parts)
-            normalized_patch[str(k)] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
+            normalized_patch[_clean_str(str(k))] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
 
         new_root = _build_post_write_root(base_parts, normalized_patch, is_patch=True)
         if not check_write_permission(base_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
@@ -2820,7 +2852,7 @@ async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
         {"event": "connected", "path": clean_path, "data": current_data, "serverTime": server_now_ms()}
     )
     await _send_ws_safe(websocket, conn_msg)
-    sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8")))
+    sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8", "replace")))
     try:
         while True:
             try:
