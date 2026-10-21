@@ -774,7 +774,7 @@ async def flush_now():
 
 async def state_flusher():
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(60)
         try:
             await flush_now()
         except Exception:
