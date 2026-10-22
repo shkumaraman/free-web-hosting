@@ -10,4 +10,3 @@ tf-keras
 huggingface_hub[hf_transfer]
 fsspec
 orjson
-requests
