@@ -32,6 +32,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable
 
@@ -48,7 +49,6 @@ except Exception:
 _n2_model = None
 _hf_fs = None
 _nsfw_sem = asyncio.Semaphore(1)
-_last_prune_hour = ""
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
@@ -62,7 +62,6 @@ AUTH_EMULATOR = os.getenv("AUTH_EMULATOR", "false").lower() in ("1", "true", "ye
 
 DATABASE: Dict[str, Any] = {}
 RULES: Dict[str, Any] = {}
-METRICS: Dict[str, Any] = {"days": {}, "hours": {}}
 INDEX_CACHE: Dict[str, Dict[str, List[tuple]]] = {}
 db_lock = asyncio.Lock()
 
@@ -71,15 +70,12 @@ active_websockets = set()
 ws_disconnect_ops: Dict[WebSocket, Dict[str, tuple]] = {}
 broadcast_queue: Optional[asyncio.Queue] = None
 
-STORAGE_BYTES = 0
-METRICS_DIRTY = False
 DB_DIRTY = False
 PULL_OK = False
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "./data")
 RULES_FILE = os.path.join(STORAGE_DIR, "rules.json")
 DB_FILE = os.path.join(STORAGE_DIR, "db.json")
-METRICS_FILE = os.path.join(STORAGE_DIR, "metrics.json")
 BACKUPS_DIR = os.path.join(STORAGE_DIR, "backups")
 UPLOADS_DIR = os.path.join(STORAGE_DIR, "uploads")
 
@@ -120,7 +116,7 @@ def dumps_bytes(obj: Any) -> bytes:
 def dumps_str(obj: Any, indent: Optional[int] = None) -> str:
     if indent is None and orjson is not None:
         try:
-            return orjson.dumps(obj).decode("utf-8")
+            return orjson.dumps(obj).decode("utf-8", "replace")
         except (TypeError, ValueError):
             pass
     try:
@@ -275,11 +271,11 @@ async def run_state_sync(direction: str, files_to_push: Optional[List[str]] = No
         if not fs:
             return
         base_remote = f"hf://buckets/{BUCKET_NAME}"
-        state_files = files_to_push or ["db.json", "rules.json", "metrics.json"]
+        state_files = files_to_push or ["db.json", "rules.json"]
 
         if direction == "pull":
             pull_succeeded = True
-            for sf in ["db.json", "rules.json", "metrics.json"]:
+            for sf in ["db.json", "rules.json"]:
                 rf = f"{base_remote}/{sf}"
                 lf = os.path.join(STORAGE_DIR, sf)
                 try:
@@ -362,7 +358,7 @@ def _atomic_write_bytes(path: str, data: bytes):
 
 
 def _atomic_write_text(path: str, text: str):
-    _atomic_write_bytes(path, text.encode("utf-8"))
+    _atomic_write_bytes(path, text.encode("utf-8", "replace"))
 
 
 def _safe_backup_path(filename: str) -> str:
@@ -680,82 +676,16 @@ def load_database():
             DATABASE.clear()
 
 
-def load_metrics():
-    global METRICS
-    if os.path.exists(METRICS_FILE):
-        try:
-            with open(METRICS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                if isinstance(raw, dict):
-                    if "days" in raw and "hours" in raw:
-                        METRICS = raw
-                    else:
-                        METRICS = {"days": raw, "hours": {}}
-                return
-        except Exception:
-            pass
-    METRICS = {"days": {}, "hours": {}}
-
-
-def save_metrics_sync():
-    try:
-        _atomic_write_bytes(METRICS_FILE, dumps_bytes(METRICS))
-    except Exception:
-        pass
-
-
 def _write_db_sync(snapshot_bytes: bytes) -> bool:
-    global STORAGE_BYTES
     try:
         _atomic_write_bytes(DB_FILE, snapshot_bytes)
-        STORAGE_BYTES = len(snapshot_bytes)
         return True
     except Exception:
         return False
 
 
-def sync_metrics(bandwidth_bytes: int = 0):
-    global METRICS_DIRTY, _last_prune_hour
-    now = datetime.now(timezone.utc)
-    day_str = now.strftime("%Y-%m-%d")
-    hour_str = now.strftime("%Y-%m-%d %H:00")
-    if "days" not in METRICS:
-        METRICS["days"] = {}
-    if "hours" not in METRICS:
-        METRICS["hours"] = {}
-    curr_conns = len(active_websockets)
-    if day_str not in METRICS["days"]:
-        METRICS["days"][day_str] = {
-            "bandwidth": 0,
-            "peak_connections": curr_conns,
-            "storage": STORAGE_BYTES,
-        }
-    if hour_str not in METRICS["hours"]:
-        METRICS["hours"][hour_str] = {
-            "bandwidth": 0,
-            "peak_connections": curr_conns,
-            "storage": STORAGE_BYTES,
-        }
-    if bandwidth_bytes > 0:
-        METRICS["days"][day_str]["bandwidth"] += bandwidth_bytes
-        METRICS["hours"][hour_str]["bandwidth"] += bandwidth_bytes
-    METRICS["days"][day_str]["storage"] = STORAGE_BYTES
-    METRICS["hours"][hour_str]["storage"] = STORAGE_BYTES
-    if curr_conns > METRICS["days"][day_str].get("peak_connections", 0):
-        METRICS["days"][day_str]["peak_connections"] = curr_conns
-    if curr_conns > METRICS["hours"][hour_str].get("peak_connections", 0):
-        METRICS["hours"][hour_str]["peak_connections"] = curr_conns
-    if hour_str != _last_prune_hour:
-        cutoff_h = (now - timedelta(hours=36)).strftime("%Y-%m-%d %H:00")
-        METRICS["hours"] = {k: v for k, v in METRICS["hours"].items() if k >= cutoff_h}
-        cutoff_d = (now - timedelta(days=60)).strftime("%Y-%m-%d")
-        METRICS["days"] = {k: v for k, v in METRICS["days"].items() if k >= cutoff_d}
-        _last_prune_hour = hour_str
-    METRICS_DIRTY = True
-
-
 async def flush_now():
-    global METRICS_DIRTY, DB_DIRTY
+    global DB_DIRTY
     files_to_push = []
     if DB_DIRTY:
         DB_DIRTY = False
@@ -764,17 +694,13 @@ async def flush_now():
             files_to_push.append("db.json")
         else:
             DB_DIRTY = True
-    if METRICS_DIRTY:
-        METRICS_DIRTY = False
-        await asyncio.to_thread(save_metrics_sync)
-        files_to_push.append("metrics.json")
     if files_to_push:
         await run_state_sync("push", files_to_push=files_to_push)
 
 
 async def state_flusher():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)
         try:
             await flush_now()
         except Exception:
@@ -797,13 +723,13 @@ async def broadcaster_worker():
             break
         clean_target, value, event_type, ts = item
         target_parts = [p for p in clean_target.split("/") if p] if clean_target else []
-        total_sent = 0
         dead: List[tuple] = []
         send_coros = []
         send_meta = []
 
         for sub_path, sockets in list(subscriptions.items()):
             if not sockets:
+                del subscriptions[sub_path]
                 continue
             sub_parts = [p for p in sub_path.split("/") if p] if sub_path else []
             if clean_target == sub_path or sub_path == "":
@@ -830,37 +756,30 @@ async def broadcaster_worker():
             else:
                 continue
 
-            p_bytes = len(payload_str.encode("utf-8", "replace"))
             for ws in list(sockets):
                 send_coros.append(_send_ws_safe(ws, payload_str))
-                send_meta.append((sub_path, ws, p_bytes))
+                send_meta.append((sub_path, ws))
 
         if send_coros:
             results = await asyncio.gather(*send_coros)
-            for (sub_path, ws, p_bytes), ok in zip(send_meta, results):
-                if ok:
-                    total_sent += p_bytes
-                else:
+            for (sub_path, ws), ok in zip(send_meta, results):
+                if not ok:
                     dead.append((sub_path, ws))
 
         for sub_path, ws in dead:
             active_websockets.discard(ws)
             if sub_path in subscriptions and ws in subscriptions[sub_path]:
                 subscriptions[sub_path].remove(ws)
-
-        if total_sent > 0:
-            sync_metrics(bandwidth_bytes=total_sent)
-
+                if not subscriptions[sub_path]:
+                    del subscriptions[sub_path]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global STORAGE_BYTES, broadcast_queue
+    global broadcast_queue
     broadcast_queue = asyncio.Queue(maxsize=5000)
     await run_state_sync("pull")
     load_rules()
     load_database()
-    load_metrics()
-    STORAGE_BYTES = len(dumps_bytes(DATABASE))
 
     flusher_task = asyncio.create_task(state_flusher())
     broadcaster_task = asyncio.create_task(broadcaster_worker())
@@ -881,43 +800,9 @@ async def lifespan(app: FastAPI):
         await flush_now()
 
 
-class BandwidthASGIMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = scope.get("path", "")
-        track = (
-            not path.startswith("/api/usage")
-            and not path.startswith("/_admin")
-            and not path.startswith("/uploads")
-        )
-        if not track:
-            await self.app(scope, receive, send)
-            return
-
-        sent_bytes = 0
-
-        async def send_wrapper(message):
-            nonlocal sent_bytes
-            if message["type"] == "http.response.body":
-                body = message.get("body", b"")
-                if body:
-                    sent_bytes += len(body)
-            await send(message)
-
-        await self.app(scope, receive, send_wrapper)
-        if sent_bytes > 0:
-            sync_metrics(bandwidth_bytes=sent_bytes)
-
-
 app = FastAPI(title="Realtime Database", lifespan=lifespan)
 
-app.add_middleware(BandwidthASGIMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -931,7 +816,6 @@ app.add_middleware(
 async def save_db():
     global DB_DIRTY
     DB_DIRTY = True
-    sync_metrics()
 
 
 def _write_rules_sync():
@@ -1417,7 +1301,6 @@ HTML_CONSOLE = """
             <button id="tab-data-btn" onclick="switchTab('data')" class="pb-2 border-b-2 border-blue-600 text-blue-600">Data</button>
             <button id="tab-rules-btn" onclick="switchTab('rules')" class="pb-2 border-b-2 border-transparent text-gray-500 hover:text-gray-700">Rules</button>
             <button id="tab-backups-btn" onclick="switchTab('backups')" class="pb-2 border-b-2 border-transparent text-gray-500 hover:text-gray-700">Backups</button>
-            <button id="tab-usage-btn" onclick="switchTab('usage')" class="pb-2 border-b-2 border-transparent text-gray-500 hover:text-gray-700">Usage</button>
         </div>
     </header>
 
@@ -1427,7 +1310,7 @@ HTML_CONSOLE = """
                 <span id="base-endpoint" class="font-medium text-gray-800 select-all">https://.../</span>
             </div>
             <button id="copy-btn" onclick="copyUrl()" title="Copy URL" class="ml-2 text-gray-400 hover:text-gray-700 shrink-0">
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
             </button>
         </div>
         <div class="flex items-center gap-2 shrink-0">
@@ -1498,76 +1381,6 @@ HTML_CONSOLE = """
                 </table>
             </div>
         </div>
-
-        <div id="tab-usage" class="hidden min-h-full max-w-lg space-y-3">
-            <div class="relative inline-block text-left">
-                <button onclick="togglePeriodDropdown()" class="flex items-center gap-2 text-xs font-medium text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 px-3 py-1.5 rounded-md shadow-xs">
-                    <svg class="w-3.5 h-3.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z"/></svg>
-                    <span id="selected-period-label">Daily (Last 24 hours)</span>
-                    <svg class="w-3 h-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-                </button>
-                <div id="period-dropdown" class="hidden absolute left-0 mt-1 w-52 bg-white border border-gray-200 rounded-lg shadow-lg py-1 z-30 text-xs text-gray-700">
-                    <button onclick="selectPeriod('daily', 'Daily (Last 24 hours)')" class="w-full text-left px-4 py-2 hover:bg-blue-50 hover:text-blue-600 flex items-center justify-between">
-                        <span>Daily (Last 24 hours)</span>
-                    </button>
-                    <button onclick="selectPeriod('weekly', 'Weekly (Last 7 days)')" class="w-full text-left px-4 py-2 hover:bg-blue-50 hover:text-blue-600 flex items-center justify-between">
-                        <span>Weekly (Last 7 days)</span>
-                    </button>
-                    <button onclick="selectPeriod('monthly', 'Monthly (Last 30 days)')" class="w-full text-left px-4 py-2 hover:bg-blue-50 hover:text-blue-600 flex items-center justify-between">
-                        <span>Monthly (Last 30 days)</span>
-                    </button>
-                </div>
-            </div>
-
-            <div class="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-xs">
-                <div id="row-conn" onclick="selectMetric('connections')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100">
-                    <div class="text-xs font-normal text-gray-600 flex items-center gap-1.5">
-                        <span>Connections</span>
-                    </div>
-                    <div class="mt-1 flex items-baseline gap-1">
-                        <span id="metric-connections" class="text-2xl font-normal text-gray-900">0</span>
-                    </div>
-                </div>
-                <div id="row-storage" onclick="selectMetric('storage')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100">
-                    <div class="text-xs font-normal text-gray-600 flex items-center gap-1.5">
-                        <span>Storage</span>
-                    </div>
-                    <div class="mt-1 flex items-baseline gap-1.5">
-                        <span id="metric-storage" class="text-2xl font-normal text-gray-900">0 KB</span>
-                        <span class="text-xs text-gray-400">current</span>
-                    </div>
-                </div>
-                <div id="row-downloads" onclick="selectMetric('downloads')" class="p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-blue-600 bg-blue-50/40">
-                    <div class="text-xs font-normal text-blue-600 flex items-center gap-1.5">
-                        <span>Downloads</span>
-                    </div>
-                    <div class="mt-1 flex items-baseline gap-1.5">
-                        <span id="metric-bandwidth" class="text-2xl font-normal text-blue-600">0 KB</span>
-                        <span class="text-xs text-gray-400">total</span>
-                    </div>
-                </div>
-                <div class="p-5 pt-3 border-t border-gray-100 bg-white">
-                    <div class="flex justify-between items-center text-[10px] text-gray-400 mb-1">
-                        <span id="chart-top-label">100</span>
-                    </div>
-                    <div class="w-full border-b border-dashed border-gray-200"></div>
-                    <div class="flex justify-between items-center text-[10px] text-gray-400 my-1">
-                        <span id="chart-mid-label">50</span>
-                    </div>
-                    <div class="w-full border-b border-gray-100"></div>
-                    <div class="h-32 relative mt-1">
-                        <svg id="usage-chart-svg" class="w-full h-full overflow-visible" viewBox="0 0 260 90">
-                            <polyline id="chart-line" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points=""/>
-                            <circle id="chart-point" cx="0" cy="0" r="3.5" fill="#2563eb" class="hidden"/>
-                        </svg>
-                    </div>
-                    <div class="flex justify-between text-[11px] text-gray-400 mt-2 border-t border-gray-200 pt-1.5">
-                        <span id="chart-date-start">-</span>
-                        <span id="chart-date-end">-</span>
-                    </div>
-                </div>
-            </div>
-        </div>
     </main>
 
     <div id="node-modal" class="fixed inset-0 bg-black/40 hidden items-center justify-center p-4 z-50">
@@ -1599,9 +1412,6 @@ HTML_CONSOLE = """
         let ws = null;
         let pingInterval = null;
         let modalMode = 'add';
-        let usageData = null;
-        let activeMetric = 'downloads';
-        let currentPeriod = 'daily';
         let expandedPaths = new Set();
         document.getElementById('base-endpoint').innerText = window.location.origin + '/';
         const SVG_PLUS = `<svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>`;
@@ -1609,38 +1419,46 @@ HTML_CONSOLE = """
         const SVG_TRASH = `<svg class="w-3 h-3 text-red-500" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>`;
 
         function toggleMenu() { document.getElementById('dropdown-menu').classList.toggle('hidden'); }
-        function togglePeriodDropdown() { document.getElementById('period-dropdown').classList.toggle('hidden'); }
         window.onclick = function(e) {
             if (!e.target.closest('#dropdown-menu') && !e.target.closest('button[onclick*="toggleMenu"]')) {
                 const m = document.getElementById('dropdown-menu');
                 if (m) m.classList.add('hidden');
             }
-            if (!e.target.closest('#period-dropdown') && !e.target.closest('button[onclick*="togglePeriodDropdown"]')) {
-                const pd = document.getElementById('period-dropdown');
-                if (pd) pd.classList.add('hidden');
-            }
         };
 
-        function selectPeriod(period, label) {
-            currentPeriod = period;
-            document.getElementById('selected-period-label').innerText = label;
-            document.getElementById('period-dropdown').classList.add('hidden');
-            updatePeriodView();
-        }
-
         function copyUrl() {
-            navigator.clipboard.writeText(window.location.origin + '/');
+            const url = (document.getElementById('base-endpoint') && document.getElementById('base-endpoint').innerText.trim()) || (window.location.origin + '/');
             const btn = document.getElementById('copy-btn');
-            if (btn) {
-                btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
-                setTimeout(() => {
-                    btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
-                }, 1500);
+            function showSuccess() {
+                if (btn) {
+                    btn.innerHTML = `<svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>`;
+                    setTimeout(() => {
+                        btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>`;
+                    }, 1500);
+                }
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(url).then(showSuccess).catch(() => fallbackCopy(url));
+            } else {
+                fallbackCopy(url);
+            }
+            function fallbackCopy(text) {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    showSuccess();
+                } catch(e) {}
             }
         }
 
         function switchTab(tab) {
-            ['data', 'rules', 'backups', 'usage'].forEach(t => {
+            ['data', 'rules', 'backups'].forEach(t => {
                 document.getElementById(`tab-${t}`).classList.add('hidden');
                 document.getElementById(`tab-${t}-btn`).className = 'pb-2 border-b-2 border-transparent text-gray-500 hover:text-gray-700';
             });
@@ -1651,7 +1469,6 @@ HTML_CONSOLE = """
             else toolbar.classList.add('hidden');
             if (tab === 'rules') loadRules();
             if (tab === 'backups') loadBackups();
-            if (tab === 'usage') loadUsage();
         }
 
         async function loadRules() {
@@ -1728,87 +1545,6 @@ HTML_CONSOLE = """
                     alert('Failed to delete backup');
                 }
             }
-        }
-
-        async function loadUsage() {
-            try {
-                const res = await fetch('/api/usage');
-                usageData = await res.json();
-                updatePeriodView();
-            } catch (e) {}
-        }
-
-        function updatePeriodView() {
-            if (!usageData) return;
-            const periodData = usageData.periods[currentPeriod];
-            document.getElementById('metric-connections').innerText = usageData.connections;
-            document.getElementById('metric-storage').innerText = usageData.storage_formatted;
-            document.getElementById('metric-bandwidth').innerText = periodData.bandwidth_formatted;
-            renderMetricChart();
-        }
-
-        function selectMetric(metric) {
-            activeMetric = metric;
-            const metrics = ['connections', 'storage', 'downloads'];
-            metrics.forEach(m => {
-                const rowId = m === 'connections' ? 'row-conn' : m === 'storage' ? 'row-storage' : 'row-downloads';
-                const valId = m === 'connections' ? 'metric-connections' : m === 'storage' ? 'metric-storage' : 'metric-bandwidth';
-                const row = document.getElementById(rowId);
-                const titleDiv = row.querySelector('div');
-                const valSpan = document.getElementById(valId);
-                if (m === metric) {
-                    row.className = 'p-4 cursor-pointer transition border-l-4 border-blue-600 bg-blue-50/40 border-b border-gray-100';
-                    titleDiv.className = 'text-xs font-normal text-blue-600 flex items-center gap-1.5';
-                    valSpan.className = 'text-2xl font-normal text-blue-600';
-                } else {
-                    row.className = 'p-4 cursor-pointer hover:bg-gray-50 transition border-l-4 border-transparent border-b border-gray-100';
-                    titleDiv.className = 'text-xs font-normal text-gray-600 flex items-center gap-1.5';
-                    valSpan.className = 'text-2xl font-normal text-gray-900';
-                }
-            });
-            renderMetricChart();
-        }
-
-        function formatBytes(bytes) {
-            if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-            if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
-            return bytes + ' B';
-        }
-
-        function renderMetricChart() {
-            if (!usageData) return;
-            const history = (usageData.periods[currentPeriod] && usageData.periods[currentPeriod].history) || [];
-            if (history.length === 0) return;
-            document.getElementById('chart-date-start').innerText = history[0].date;
-            document.getElementById('chart-date-end').innerText = history[history.length - 1].date;
-            let values = [];
-            if (activeMetric === 'connections') values = history.map(h => h.connections);
-            else if (activeMetric === 'storage') values = history.map(h => h.storage);
-            else if (activeMetric === 'downloads') values = history.map(h => h.bandwidth);
-            let maxVal = Math.max(...values, 1);
-            let topLabel = ''; let midLabel = '';
-            if (activeMetric === 'connections') {
-                maxVal = Math.max(Math.ceil(maxVal), 2);
-                topLabel = maxVal.toString();
-                midLabel = Math.round(maxVal / 2).toString();
-            } else {
-                topLabel = formatBytes(maxVal);
-                midLabel = formatBytes(maxVal / 2);
-            }
-            document.getElementById('chart-top-label').innerText = topLabel;
-            document.getElementById('chart-mid-label').innerText = midLabel;
-            let pts = [];
-            values.forEach((v, idx) => {
-                let x = (idx / (values.length - 1 || 1)) * 248 + 6;
-                let y = 82 - (Math.min(v, maxVal) / maxVal) * 72;
-                pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
-            });
-            document.getElementById('chart-line').setAttribute('points', pts.join(' '));
-            const last = pts[pts.length - 1].split(',');
-            const pt = document.getElementById('chart-point');
-            pt.setAttribute('cx', last[0]); pt.setAttribute('cy', last[1]);
-            pt.classList.remove('hidden');
         }
 
         function applyLocalDelta(path, event, data) {
@@ -2376,7 +2112,7 @@ async def restore_backup(filename: str):
     def _read():
         with open(src, "rb") as f:
             raw = f.read()
-            return orjson.loads(raw) if orjson is not None else json.loads(raw.decode("utf-8"))
+            return orjson.loads(raw) if orjson is not None else json.loads(raw.decode("utf-8", "replace"))
 
     data = normalize_firebase_data(await asyncio.to_thread(_read))
     async with db_lock:
@@ -2421,83 +2157,6 @@ async def delete_backup(filename: str):
 
     asyncio.create_task(run_cloud_delete(f"backups/{filename}"))
     return {"status": "deleted"}
-
-
-@app.get("/api/usage")
-async def get_usage_metrics():
-    storage_bytes = STORAGE_BYTES
-    now = datetime.now(timezone.utc)
-
-    def format_size(bytes_num):
-        if bytes_num >= 1024 * 1024 * 1024:
-            return f"{bytes_num / (1024 * 1024 * 1024):.2f} GB"
-        if bytes_num >= 1024 * 1024:
-            return f"{bytes_num / (1024 * 1024):.2f} MB"
-        if bytes_num >= 1024:
-            return f"{bytes_num / 1024:.2f} KB"
-        return f"{bytes_num} B"
-
-    daily_history = []
-    daily_bandwidth = 0
-    for i in range(23, -1, -1):
-        dt = now - timedelta(hours=i)
-        h_key = dt.strftime("%Y-%m-%d %H:00")
-        h_label = dt.strftime("%I %p")
-        rec = METRICS.get("hours", {}).get(h_key, {})
-        b = rec.get("bandwidth", 0)
-        c = rec.get("peak_connections", 0)
-        s = rec.get("storage", storage_bytes)
-        daily_bandwidth += b
-        daily_history.append({"date": h_label, "bandwidth": b, "connections": c, "storage": s})
-
-    weekly_history = []
-    weekly_bandwidth = 0
-    for i in range(6, -1, -1):
-        dt = (now - timedelta(days=i)).date()
-        d_key = dt.strftime("%Y-%m-%d")
-        d_label = dt.strftime("%a")
-        rec = METRICS.get("days", {}).get(d_key, {})
-        b = rec.get("bandwidth", 0)
-        c = rec.get("peak_connections", 0)
-        s = rec.get("storage", storage_bytes)
-        weekly_bandwidth += b
-        weekly_history.append({"date": d_label, "bandwidth": b, "connections": c, "storage": s})
-
-    monthly_history = []
-    monthly_bandwidth = 0
-    for i in range(29, -1, -1):
-        dt = (now - timedelta(days=i)).date()
-        d_key = dt.strftime("%Y-%m-%d")
-        d_label = dt.strftime("%b %d")
-        rec = METRICS.get("days", {}).get(d_key, {})
-        b = rec.get("bandwidth", 0)
-        c = rec.get("peak_connections", 0)
-        s = rec.get("storage", storage_bytes)
-        monthly_bandwidth += b
-        monthly_history.append({"date": d_label, "bandwidth": b, "connections": c, "storage": s})
-
-    return {
-        "connections": len(active_websockets),
-        "storage_bytes": storage_bytes,
-        "storage_formatted": format_size(storage_bytes),
-        "periods": {
-            "daily": {
-                "bandwidth_bytes": daily_bandwidth,
-                "bandwidth_formatted": format_size(daily_bandwidth),
-                "history": daily_history,
-            },
-            "weekly": {
-                "bandwidth_bytes": weekly_bandwidth,
-                "bandwidth_formatted": format_size(weekly_bandwidth),
-                "history": weekly_history,
-            },
-            "monthly": {
-                "bandwidth_bytes": monthly_bandwidth,
-                "bandwidth_formatted": format_size(monthly_bandwidth),
-                "history": monthly_history,
-            },
-        },
-    }
 
 
 NO_STORE_HEADERS = {"Cache-Control": "no-store, max-age=0"}
@@ -2843,16 +2502,18 @@ async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
     await websocket.accept()
     active_websockets.add(websocket)
     ws_disconnect_ops[websocket] = {}
+    subscribed_paths: set = set()
+
     clean_path = "/".join(path_parts)
-    if clean_path not in subscriptions:
-        subscriptions[clean_path] = []
-    subscriptions[clean_path].append(websocket)
+    subscriptions.setdefault(clean_path, []).append(websocket)
+    subscribed_paths.add(clean_path)
+
     current_data = get_nested(DATABASE, path_parts) if path_parts else DATABASE
     conn_msg = dumps_str(
         {"event": "connected", "path": clean_path, "data": current_data, "serverTime": server_now_ms()}
     )
     await _send_ws_safe(websocket, conn_msg)
-    sync_metrics(bandwidth_bytes=len(conn_msg.encode("utf-8", "replace")))
+
     try:
         while True:
             try:
@@ -2869,59 +2530,209 @@ async def ws_endpoint(websocket: WebSocket, full_path: str = ""):
                 msg = json.loads(raw_msg)
             except Exception:
                 continue
-            if isinstance(msg, dict):
-                msg_type = msg.get("type")
-                if msg_type == "ping":
-                    await _send_ws_safe(websocket, dumps_str({"event": "pong", "serverTime": server_now_ms()}))
-                elif msg_type == "time":
-                    now_ms = server_now_ms()
-                    client_time = msg.get("clientTime")
-                    offset = (now_ms - client_time) if _is_number(client_time) else 0
-                    await _send_ws_safe(
-                        websocket,
-                        dumps_str({"event": "time", "serverTime": now_ms, "serverTimeOffset": offset}),
-                    )
-                elif msg_type in ("onDisconnectPut", "onDisconnectPatch", "onDisconnectDelete", "onDisconnectCancel"):
-                    raw_target = msg.get("path")
-                    if raw_target is None:
-                        target_clean = clean_path
+            if not isinstance(msg, dict):
+                continue
+
+            msg_type = msg.get("type") or msg.get("action")
+            if msg_type == "ping":
+                await _send_ws_safe(websocket, dumps_str({"event": "pong", "serverTime": server_now_ms()}))
+
+            elif msg_type == "time":
+                now_ms = server_now_ms()
+                client_time = msg.get("clientTime")
+                offset = (now_ms - client_time) if _is_number(client_time) else 0
+                await _send_ws_safe(
+                    websocket,
+                    dumps_str({"event": "time", "serverTime": now_ms, "serverTimeOffset": offset}),
+                )
+
+            elif msg_type == "auth":
+                token = msg.get("token") or msg.get("cred")
+                new_auth = _resolve_auth_from_token(token)
+                if token and not new_auth:
+                    await _send_ws_safe(websocket, dumps_str({"event": "authAck", "status": "error", "message": "Invalid token"}))
+                else:
+                    auth = new_auth
+                    await _send_ws_safe(websocket, dumps_str({"event": "authAck", "status": "ok", "uid": auth.uid if auth else None}))
+
+            elif msg_type in ("subscribe", "listen", "q"):
+                target_path = strip_json_suffix(str(msg.get("path", ""))).strip("/")
+                t_parts = [p for p in target_path.split("/") if p]
+                if not check_read_permission(t_parts, auth):
+                    await _send_ws_safe(websocket, dumps_str({"event": "error", "path": target_path, "message": "Permission denied"}))
+                else:
+                    subscriptions.setdefault(target_path, []).append(websocket)
+                    subscribed_paths.add(target_path)
+                    snap_data = get_nested(DATABASE, t_parts) if t_parts else DATABASE
+                    await _send_ws_safe(websocket, dumps_str({"event": "snapshot", "path": target_path, "data": snap_data, "serverTime": server_now_ms()}))
+
+            elif msg_type in ("unsubscribe", "unlisten", "n"):
+                target_path = strip_json_suffix(str(msg.get("path", ""))).strip("/")
+                subscribed_paths.discard(target_path)
+                if target_path in subscriptions and websocket in subscriptions[target_path]:
+                    subscriptions[target_path].remove(websocket)
+                    if not subscriptions[target_path]:
+                        del subscriptions[target_path]
+
+            elif msg_type in ("set", "put", "update", "patch", "push", "remove", "delete"):
+                raw_target = strip_json_suffix(str(msg.get("path", ""))).strip("/")
+                req_id = msg.get("reqId") or msg.get("r")
+                t_parts = [p for p in raw_target.split("/") if p]
+                clean_t = "/".join(t_parts)
+                now_ms = server_now_ms()
+                val = msg.get("data")
+                del_paths = []
+
+                try:
+                    async with db_lock:
+                        if msg_type in ("push",):
+                            push_id = generate_push_id()
+                            target_parts = t_parts + [push_id]
+                            clean_t = "/".join(target_parts)
+                            resolved_val = resolve_server_values(val, None, now_ms)
+                            cleaned_val = normalize_firebase_data(resolved_val)
+                            new_root = _build_post_write_root(target_parts, cleaned_val, is_patch=False)
+                            if not check_write_permission(target_parts, cleaned_val, auth, is_patch=False, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Permission denied"}))
+                                continue
+                            if not check_validation(target_parts, cleaned_val, auth, is_patch=False, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Validation failed"}))
+                                continue
+                            if cleaned_val is not None:
+                                set_nested(DATABASE, target_parts, cleaned_val)
+                                invalidate_cache(target_parts)
+                                await save_db()
+                            await broadcast(clean_t, cleaned_val, "put")
+                            await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "path": clean_t, "name": push_id, "status": "ok"}))
+
+                        elif msg_type in ("update", "patch"):
+                            if not isinstance(val, dict):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Data must be a dictionary"}))
+                                continue
+                            normalized_patch: Dict[str, Any] = {}
+                            for k, v in val.items():
+                                rel_parts = [p for p in str(k).strip("/").split("/") if p]
+                                existing = get_nested(DATABASE, t_parts + rel_parts)
+                                normalized_patch[_clean_str(str(k))] = normalize_firebase_data(resolve_server_values(v, existing, now_ms))
+                            new_root = _build_post_write_root(t_parts, normalized_patch, is_patch=True)
+                            if not check_write_permission(t_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Permission denied"}))
+                                continue
+                            if not check_validation(t_parts, normalized_patch, auth, is_patch=True, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Validation failed"}))
+                                continue
+                            for rel_key, pv in normalized_patch.items():
+                                rel_parts = [p for p in str(rel_key).strip("/").split("/") if p]
+                                tp = t_parts + rel_parts
+                                if not tp:
+                                    continue
+                                if pv is None:
+                                    target = get_nested(DATABASE, tp)
+                                    if target is not None:
+                                        del_paths.extend(remove_associated_files(target))
+                                    delete_nested(DATABASE, tp)
+                                else:
+                                    set_nested(DATABASE, tp, pv)
+                                invalidate_cache(tp)
+                            invalidate_cache(t_parts)
+                            await save_db()
+                            await broadcast(clean_t, normalized_patch, "patch")
+                            await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "path": clean_t, "status": "ok"}))
+
+                        elif msg_type in ("set", "put"):
+                            current_data = get_nested(DATABASE, t_parts) if t_parts else DATABASE
+                            resolved_val = resolve_server_values(val, current_data, now_ms)
+                            cleaned_val = normalize_firebase_data(resolved_val)
+                            new_root = _build_post_write_root(t_parts, cleaned_val, is_patch=False)
+                            if not check_write_permission(t_parts, cleaned_val, auth, is_patch=False, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Permission denied"}))
+                                continue
+                            if not check_validation(t_parts, cleaned_val, auth, is_patch=False, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Validation failed"}))
+                                continue
+                            if cleaned_val is None:
+                                if not t_parts:
+                                    del_paths.extend(remove_associated_files(DATABASE))
+                                    DATABASE.clear()
+                                else:
+                                    if current_data is not None:
+                                        del_paths.extend(remove_associated_files(current_data))
+                                    delete_nested(DATABASE, t_parts)
+                            else:
+                                set_nested(DATABASE, t_parts, cleaned_val)
+                            invalidate_cache(t_parts)
+                            await save_db()
+                            await broadcast(clean_t, cleaned_val, "delete" if cleaned_val is None else "put")
+                            await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "path": clean_t, "status": "ok"}))
+
+                        elif msg_type in ("remove", "delete"):
+                            new_root = _build_post_write_root(t_parts, None, is_patch=False)
+                            if not check_write_permission(t_parts, None, auth, is_patch=False, new_root_val=new_root):
+                                await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": "Permission denied"}))
+                                continue
+                            if not t_parts:
+                                del_paths.extend(remove_associated_files(DATABASE))
+                                DATABASE.clear()
+                            else:
+                                target = get_nested(DATABASE, t_parts)
+                                if target is not None:
+                                    del_paths.extend(remove_associated_files(target))
+                                delete_nested(DATABASE, t_parts)
+                            invalidate_cache(t_parts)
+                            await save_db()
+                            await broadcast(clean_t, None, "delete")
+                            await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "path": clean_t, "status": "ok"}))
+
+                    if del_paths:
+                        async def _del_files():
+                            for p in set(del_paths):
+                                await run_cloud_delete(p)
+                        asyncio.create_task(_del_files())
+
+                except Exception as e:
+                    await _send_ws_safe(websocket, dumps_str({"event": "writeAck", "reqId": req_id, "status": "error", "error": str(e)}))
+
+            elif msg_type in ("onDisconnectPut", "onDisconnectPatch", "onDisconnectDelete", "onDisconnectCancel"):
+                raw_target = msg.get("path")
+                if raw_target is None:
+                    target_clean = clean_path
+                else:
+                    rel_clean = strip_json_suffix(str(raw_target)).strip("/")
+                    if str(raw_target).startswith("/"):
+                        target_clean = rel_clean
                     else:
-                        rel_clean = strip_json_suffix(str(raw_target)).strip("/")
-                        if str(raw_target).startswith("/"):
-                            target_clean = rel_clean
-                        else:
-                            target_clean = f"{clean_path}/{rel_clean}".strip("/") if clean_path else rel_clean
+                        target_clean = f"{clean_path}/{rel_clean}".strip("/") if clean_path else rel_clean
 
-                    ops = ws_disconnect_ops.setdefault(websocket, {})
-                    if msg_type == "onDisconnectCancel":
-                        ops.pop(target_clean, None)
-                    elif msg_type == "onDisconnectPut":
-                        ops[target_clean] = ("put", msg.get("data"))
-                    elif msg_type == "onDisconnectPatch":
-                        if isinstance(msg.get("data"), dict):
-                            ops[target_clean] = ("patch", msg.get("data"))
-                    elif msg_type == "onDisconnectDelete":
-                        ops[target_clean] = ("delete", None)
+                ops = ws_disconnect_ops.setdefault(websocket, {})
+                if msg_type == "onDisconnectCancel":
+                    ops.pop(target_clean, None)
+                elif msg_type == "onDisconnectPut":
+                    ops[target_clean] = ("put", msg.get("data"))
+                elif msg_type == "onDisconnectPatch":
+                    if isinstance(msg.get("data"), dict):
+                        ops[target_clean] = ("patch", msg.get("data"))
+                elif msg_type == "onDisconnectDelete":
+                    ops[target_clean] = ("delete", None)
 
-                    await _send_ws_safe(
-                        websocket,
-                        dumps_str({"event": "onDisconnectAck", "type": msg_type, "path": target_clean}),
-                    )
+                await _send_ws_safe(
+                    websocket,
+                    dumps_str({"event": "onDisconnectAck", "type": msg_type, "path": target_clean}),
+                )
     except (WebSocketDisconnect, Exception):
         pass
     finally:
         active_websockets.discard(websocket)
-        if clean_path in subscriptions and websocket in subscriptions[clean_path]:
-            subscriptions[clean_path].remove(websocket)
-            if not subscriptions[clean_path]:
-                del subscriptions[clean_path]
+        for p in subscribed_paths:
+            if p in subscriptions and websocket in subscriptions[p]:
+                subscriptions[p].remove(websocket)
+                if not subscriptions[p]:
+                    del subscriptions[p]
         pending_ops = ws_disconnect_ops.pop(websocket, {})
         if pending_ops:
             try:
                 await execute_disconnect_ops(pending_ops, auth)
             except Exception:
                 pass
-        sync_metrics()
 
 
 if __name__ == "__main__":
