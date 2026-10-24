@@ -1,8 +1,5 @@
 import os
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-
 import ast
 import asyncio
 import hashlib
@@ -47,15 +44,12 @@ try:
 except Exception:
     pyjwt = None
 
-_n2_model = None
 _hf_fs = None
-_nsfw_sem = asyncio.Semaphore(1)
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "plygram/backend")
 CLOUD_SYNC_LOCK = asyncio.Lock()
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
-NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.88"))
 
 AUTH_SECRET = os.getenv("AUTH_SECRET")
 AUTH_ALGORITHM = os.getenv("AUTH_ALGORITHM", "HS256")
@@ -319,22 +313,6 @@ async def run_state_sync(direction: str, files_to_push: Optional[List[str]] = No
             await asyncio.to_thread(_sync)
     except Exception:
         pass
-
-
-def check_nsfw_image(file_path: str) -> bool:
-    global _n2_model
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif"]:
-        return False
-    try:
-        if _n2_model is None:
-            import opennsfw2 as n2
-            _n2_model = n2
-        nsfw_prob = float(_n2_model.predict_image(file_path))
-        return nsfw_prob >= NSFW_THRESHOLD
-    except Exception as e:
-        print("NSFW check failed, blocking:", repr(e))
-        return True
 
 
 def strip_json_suffix(path: str) -> str:
@@ -2178,7 +2156,6 @@ async def upload_media_file(
     request: Request,
     file: UploadFile = File(...),
     target_path: str = Form("uploads"),
-    is_public: str = Form("false"),
 ):
     auth = resolve_auth(request)
     push_id = generate_push_id()
@@ -2208,22 +2185,6 @@ async def upload_media_file(
             raise e
         raise HTTPException(status_code=500, detail=f"Failed to write file: {str(e)}")
 
-    public_bool = is_public.lower() in ("true", "1", "yes")
-
-    if public_bool:
-        async with _nsfw_sem:
-            is_nsfw = await asyncio.to_thread(check_nsfw_image, dest_path)
-        if is_nsfw:
-            if os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except Exception:
-                    pass
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Explicit content is not allowed.",
-            )
-
     if HF_TOKEN and not HF_TOKEN.startswith("hf_YOUR"):
         file_url = f"https://huggingface.co/buckets/{BUCKET_NAME}/resolve/uploads/{saved_filename}"
     else:
@@ -2237,7 +2198,6 @@ async def upload_media_file(
         "url": file_url,
         "content_type": file.content_type,
         "size": size,
-        "is_public": public_bool,
         "timestamp": server_now_ms(),
     }
 
