@@ -3,10 +3,6 @@ uvicorn[standard]
 python-multipart
 simpleeval
 PyJWT
-opennsfw2
-Pillow
-tensorflow-cpu
-tf-keras
 huggingface_hub[hf_transfer]
 fsspec
 orjson
