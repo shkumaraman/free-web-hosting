@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+websockets
 python-multipart
 simpleeval
 PyJWT
