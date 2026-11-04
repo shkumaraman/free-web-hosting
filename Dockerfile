@@ -154,7 +154,7 @@ RUN find /etc/php* -name php.ini -exec sh -c '\
     echo "opcache.revalidate_freq=2" >> "{}" && \
     echo "realpath_cache_size=1024K" >> "{}" && \
     echo "realpath_cache_ttl=300" >> "{}" && \
-    echo "session.save_path=\"/tmp/sessions\"" >> "{}" && \
+    echo "session.save_path=\"/data/sessions\"" >> "{}" && \
     echo "sys_temp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_tmp_dir=\"/tmp\"" >> "{}" && \
     echo "upload_max_filesize=512M" >> "{}" && \
@@ -174,7 +174,6 @@ RUN mkdir -p \
     /data/htdocs \
     /data/sessions \
     /data/config \
-    /data/webapps \
     /data/backups \
     /var/www/localhost/htdocs \
     /usr/share/webapps/filemanager \
@@ -270,22 +269,23 @@ stop_all() {
 }
 trap 'stop_all 0' INT TERM
 
-mkdir -p /run/mysqld /run/php-fpm /run/apache2 /tmp/sessions
-chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp /tmp/sessions 2>/dev/null || true
-chmod 700 /tmp/sessions 2>/dev/null || true
+mkdir -p /run/mysqld /run/php-fpm /run/apache2
+chown -R appuser:appgroup /run/mysqld /run/php-fpm /run/apache2 /tmp 2>/dev/null || true
 
 rm -f /run/mysqld/mysqld.sock /run/mysqld/mysqld.pid /run/apache2/httpd.pid /run/php-fpm/php-fpm.pid 2>/dev/null || true
 
 if [ "$DATA_OK" -eq 0 ]; then
-    mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups"
+    mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/backups"
     chown -R appuser:appgroup "$DATA_DIR" 2>/dev/null || true
 fi
 
 rm -f "$DATA_DIR/mysql/tc.log" "$DATA_DIR/mysql/aria_log_control" 2>/dev/null || true
 
-mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups"
-chown -R appuser:appgroup "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/webapps" "$DATA_DIR/backups" 2>/dev/null || true
+mkdir -p "$DATA_DIR/htdocs" "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/backups"
+chown -R appuser:appgroup "$DATA_DIR/sessions" "$DATA_DIR/mysql" "$DATA_DIR/config" "$DATA_DIR/backups" 2>/dev/null || true
 chmod 700 "$DATA_DIR/sessions" 2>/dev/null || true
+
+find /etc/php* -name php.ini -exec sed -i "s|^session.save_path = .*|session.save_path = \"$DATA_DIR/sessions\"|g" {} +
 
 if [ "$DATA_OK" -eq 1 ]; then
     find /data/backups -maxdepth 1 -type d -name 'mysql_corrupt_*' | sort | head -n -3 | xargs -r rm -rf 2>/dev/null || true
@@ -296,15 +296,6 @@ if [ "$DATA_OK" -eq 1 ]; then
         echo ">>> WARNING: Low disk space on /data (${AVAIL_KB} KB left)"
     fi
 fi
-
-for app in phpmyadmin filemanager; do
-    if [ ! -d "$DATA_DIR/webapps/$app" ]; then
-        mkdir -p "$DATA_DIR/webapps/$app"
-        cp -a "/usr/share/webapps/$app/." "$DATA_DIR/webapps/$app/" 2>/dev/null || true
-    fi
-    rm -rf "/usr/share/webapps/$app" 2>/dev/null || true
-    ln -sfn "$DATA_DIR/webapps/$app" "/usr/share/webapps/$app"
-done
 
 if [ ! -f "$DATA_DIR/config/pma_secret.php" ]; then
     BLOWFISH=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c 32)
@@ -507,7 +498,7 @@ if ! kill -0 "$HTTPD_PID" 2>/dev/null; then
     stop_all 1
 fi
 
-echo ">>> Server is fully ready! Starting backup loop..."
+echo ">>> Server is fully ready! Starting maintenance and backup loop..."
 (
     while true; do
         sleep 3600
@@ -521,6 +512,15 @@ echo ">>> Server is fully ready! Starting backup loop..."
         else
             mariadb-dump --socket=/run/mysqld/mysqld.sock -u root -p"${ROOT_PASS}" "${MYSQL_DATABASE}" > "$DATA_DIR/backups/db_${TS}.sql" 2>/dev/null || true
         fi
+
+        find "$DATA_DIR/sessions" -type f -name 'sess_*' -mmin +1440 -delete 2>/dev/null || true
+        find /tmp -maxdepth 1 -type f -name 'php*' -mmin +1440 -delete 2>/dev/null || true
+
+        for LOGFILE in /tmp/php-error.log /tmp/mariadb.log /tmp/apache.log /tmp/redis.log /tmp/php.log; do
+            if [ -f "$LOGFILE" ] && [ "$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)" -gt 52428800 ]; then
+                : > "$LOGFILE" 2>/dev/null || true
+            fi
+        done
     done
 ) &
 BACKUP_PID="$!"
