@@ -1,9 +1,7 @@
 fastapi
 uvicorn[standard]
-websockets
 python-multipart
 simpleeval
 PyJWT
-huggingface_hub[hf_transfer]
-fsspec
+huggingface_hub[hf_xet]
 orjson
